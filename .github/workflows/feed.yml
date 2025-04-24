@@ -16,4 +16,4 @@ jobs:
       - run: python kucoin_solayer_feed.py
         env:
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
-          GIST_ID: <YOUR_GIST_ID>
+          GIST_ID: cae271a238f04de0fe7359f03490bc5b
