@@ -1,50 +1,36 @@
 #!/usr/bin/env python3
 """
-kucoin_solayer_feed.py – enhanced
-=================================
-Push **rich** Solayer‑futures data to a GitHub Gist so the trading‑bot has alles‑in‑één input.
+kucoin_solayer_feed.py – enhanced (timestamp‑fix)
+=================================================
+Same functionality as previous commit, **but timestamps are now 100 % correct** and the deprecation‑warning is removed.
 
-New in this version
--------------------
-* **last_20_candles**  – list of the 20 most recent 15 m candles (OHLC‑V)
-* **funding_rate**     – current funding rate & next settlement time
-* **open_interest**    – current open interest (contracts)
-* **order_book_depth** – cum. bid/ask volume within ±0.2 % of mid‑price
+Highlights
+----------
+* KuCoin returns candle‑time in **seconds**; we convert to **milliseconds** (`*1000`).
+* Helper `utc_iso(ts_ms)` gives a readable ISO‑8601 string with explicit **UTC offset**.
+* Replaced deprecated `datetime.utcfromtimestamp`.
 
-JSON layout written to the gist
--------------------------------
+JSON example
+------------
 ```json
 {
-  "timestamp": 1713967200000,
+  "timestamp": 1745793600000,
   "symbol": "SOLAYER-USDT",
-  "granularity": "15min",
-  "latest_candle": { … },
-  "last_20_candles": [ {…}, … ],
-  "funding_rate": { "rate": 0.00014, "next_funding_time": 1713974400000 },
-  "open_interest": 1245789,
-  "order_book": { "bid_vol": 83251, "ask_vol": 79412 }
+  "latest_candle": {
+    "ts": 1745792700000,
+    "iso": "2025-04-27T14:25:00+00:00",
+    "open": 2.2325,
+    …
+  },
+  …
 }
 ```
-
-Environment vars (unchanged + optional)
----------------------------------------
-* SYMBOL, GRANULARITY, GIST_TOKEN, GIST_ID, FILE_NAME
-* DEPTH_PCT (default 0.2)  – % around mid‑price to sum order‑book volume
-
-KuCoin public endpoints used
-----------------------------
-* `/api/v1/market/candles`               – OHLCV
-* `/api/v1/funding-rate/symbol`          – funding rate
-* `/api/v1/openInterest?symbol=`         – open interest
-* `/api/v1/market/orderbook/level2_20`   – order book top‑20 (bids/asks)
-
-The script keeps the request budget low: one call per endpoint.
 """
 
 import os
 import json
 import datetime as dt
-from typing import List, Dict
+from typing import List, Dict, Any
 import requests
 
 BASE = "https://api.kucoin.com"
@@ -52,10 +38,16 @@ BASE = "https://api.kucoin.com"
 # ---------- helpers ---------------------------------------------------------
 
 def ts_ms() -> int:
-    return int(dt.datetime.utcnow().timestamp() * 1000)
+    """Current UTC timestamp in **milliseconds**."""
+    return int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)
 
 
-def get(endpoint: str, params: dict | None = None):
+def utc_iso(ts_ms: int) -> str:
+    """Return ISO‑8601 string (UTC) from ms‑epoch."""
+    return dt.datetime.fromtimestamp(ts_ms / 1000, tz=dt.timezone.utc).isoformat()
+
+
+def get(endpoint: str, params: dict[str, Any] | None = None):
     r = requests.get(f"{BASE}{endpoint}", params=params, timeout=10)
     r.raise_for_status()
     return r.json()
@@ -67,16 +59,19 @@ def fetch_candles(symbol: str, tf: str, limit: int = 20) -> List[Dict]:
     if not data:
         raise RuntimeError("No candles returned")
     candles = []
-    for raw in data[:limit][::-1]:  # KuCoin returns newest‑>oldest
-        c = {
-            "ts": int(raw[0]),
-            "open": float(raw[1]),
-            "close": float(raw[2]),
-            "high": float(raw[3]),
-            "low": float(raw[4]),
-            "vol": float(raw[5]),
-        }
-        candles.append(c)
+    for raw in data[:limit][::-1]:  # newest→oldest → reverse
+        ts_ms_val = int(raw[0]) * 1000  # KuCoin gives seconds → convert to ms
+        candles.append(
+            {
+                "ts": ts_ms_val,
+                "iso": utc_iso(ts_ms_val),
+                "open": float(raw[1]),
+                "close": float(raw[2]),
+                "high": float(raw[3]),
+                "low": float(raw[4]),
+                "vol": float(raw[5]),
+            }
+        )
     return candles
 
 
@@ -85,7 +80,8 @@ def fetch_funding(symbol: str):
         d = get("/api/v1/funding-rate/symbol", {"symbol": symbol})["data"]
         return {
             "rate": float(d["fundingRate"]),
-            "next_time": int(d["nextSettleTime"])
+            "next_time": int(d["nextSettleTime"]),
+            "next_time_iso": utc_iso(int(d["nextSettleTime"]))
         }
     except Exception:
         return None
@@ -137,23 +133,20 @@ def main():
     depth_pct = float(os.getenv("DEPTH_PCT", 0.2))
 
     candles = fetch_candles(symbol, tf, 20)
-    latest = candles[-1]
 
     payload = {
         "timestamp": ts_ms(),
+        "iso": utc_iso(ts_ms()),
         "symbol": symbol,
         "granularity": tf,
-        "latest_candle": latest,
+        "latest_candle": candles[-1],
         "last_20_candles": candles,
         "funding_rate": fetch_funding(symbol),
         "open_interest": fetch_open_interest(symbol),
         "order_book": fetch_depth(symbol, depth_pct)
     }
 
-    if update_gist(token, gist_id, file_name, payload):
-        print("Upload success")
-    else:
-        print("Upload failed")
+    print("Upload success" if update_gist(token, gist_id, file_name, payload) else "Upload failed")
 
 
 if __name__ == "__main__":
