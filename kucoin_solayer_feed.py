@@ -1,121 +1,120 @@
 #!/usr/bin/env python3
 """
-kucoin_solayer_feed.py – v4
-• verzamelt gegarandeerd 300 × 15-min candles (KuCoin max = 150 per call)
+kucoin_solayer_feed.py – v4-fix
+• vergaart gegarandeerd 300 × 15-min-candles (KuCoin-API max 150/call)
 • berekent EMA20/50/200, RSI14, VWAP, ATR14, vol_mean20
-• uploadt snapshot + volledige history naar je Gist
+• uploadt snapshot + volledige history naar GitHub Gist
 """
 
-import os, json, time, datetime as _dt
-import requests, pandas as pd, ta
+import os, json, time, datetime as dt, requests, pandas as pd, ta
 
-API_URL   = "https://api.kucoin.com/api/v1/market/candles"
-NEEDED    = 300                  # aantal candles in history
-TF        = "15min"              # timeframe voor granularity-mapping
-SEC_PER_CANDLE = 900             # 15 min in seconden
-DEFAULT_FILE  = "solayer_feed.json"
+API_URL           = "https://api.kucoin.com/api/v1/market/candles"
+HISTORY           = 300            # benodigde candles
+SEC_PER_CANDLE    = 15 * 60
+DEFAULT_FILE_NAME = "solayer_feed.json"
+DEFAULT_TF        = "15min"        # KuCoin interval-code
 
 pd.options.mode.copy_on_write = True
 
-# ---------- helpers --------------------------------------------------------
-def fetch_batch(symbol: str, granularity: str, limit: int = 150,
-                end_at: int | None = None) -> list[list[float]]:
-    """Eén API-call – retourneert lijst met candles (nieuwste eerst)."""
-    params = {"symbol": symbol, "type": granularity, "limit": limit}
+
+# ───────────────────────────────── helpers ──────────────────────────────────
+def _fetch_batch(symbol: str, tf: str, limit: int = 150,
+                 end_at: int | None = None) -> list[list[float]]:
+    """ Eén API-call. KuCoin retourneert nieuw->oud. """
+    params = {"symbol": symbol, "type": tf, "limit": limit}
     if end_at is not None:
-        params["endAt"] = end_at
+        params["endAt"] = end_at                           # unix-sec
     r = requests.get(API_URL, params=params, timeout=10)
     r.raise_for_status()
-    return r.json()["data"]            # formaat: [[ts,open,close,high,low,vol,turnover], …]
+    return r.json()["data"]
 
-def fetch_frame(symbol: str, granularity: str) -> pd.DataFrame:
-    """Haalt minimaal 300 candles op door te pagineren met endAt."""
-    batches, got = [], 0
-    end_at = None                       # None ⇒ meest recente batch
 
-    while got < NEEDED:
-        chunk = fetch_batch(symbol, granularity, limit=150, end_at=end_at)
+def fetch_frame(symbol: str, tf: str) -> pd.DataFrame:
+    """Haalt *minimaal* 300 candles op door te pagineren met endAt."""
+    raw, got, end_at = [], 0, None
+
+    while got < HISTORY:
+        chunk = _fetch_batch(symbol, tf, 150, end_at)
         if not chunk:
-            break                      # fail-safe
-        batches.extend(chunk)
+            break                              # safety-escape
+        raw.extend(chunk)
         got += len(chunk)
-        # volgende iteratie: eindpunt = oudste ts − 1 candle
+        # volgend eindpunt = starttijd oudste candle – 1 sec
         oldest_ts_ms = float(chunk[-1][0])
-        end_at = int(oldest_ts_ms/1000 - SEC_PER_CANDLE)
+        end_at = int(oldest_ts_ms / 1000 - SEC_PER_CANDLE - 1)
 
     cols = ["ts", "open", "close", "high", "low", "vol", "turnover"]
-    df   = pd.DataFrame(batches, columns=cols).astype(float)
-    df["ts"] = df["ts"].astype(int)
-    df.sort_values("ts", inplace=True)          # oldest → newest
-    df = df.tail(NEEDED)                        # precies 300 laatste
+    df   = pd.DataFrame(raw, columns=cols).astype(float)
 
-    # ---------------- indicatoren ----------------
-    df["ema20"]   = ta.trend.ema_indicator(df["close"],  20)
-    df["ema50"]   = ta.trend.ema_indicator(df["close"],  50)
+    df["ts"] = df["ts"].astype(int)
+    df.sort_values("ts", inplace=True)               # oldest → newest
+    df.drop_duplicates("ts", keep="last", inplace=True)
+    df = df.tail(HISTORY)                            # exact 300
+
+    # ────── indicatoren ──────
+    df["ema20"]   = ta.trend.ema_indicator(df["close"], 20)
+    df["ema50"]   = ta.trend.ema_indicator(df["close"], 50)
     df["ema200"]  = ta.trend.ema_indicator(df["close"], 200)
     df["rsi14"]   = ta.momentum.rsi(df["close"], 14)
     df["vwap"]    = ta.volume.volume_weighted_average_price(
                        df["high"], df["low"], df["close"], df["vol"], window=14)
     df["atr14"]   = ta.volatility.average_true_range(
                        df["high"], df["low"], df["close"], window=14)
-    df["vol_mean20"] = df["vol"].rolling(20).mean()
-    return df
+    df["vol_mean20"] = df["vol"].rolling(20, min_periods=1).mean()
+    return df.reset_index(drop=True)
+
 
 def iso(ts_ms: int) -> str:
-    return _dt.datetime.utcfromtimestamp(ts_ms//1000).isoformat()
+    return dt.datetime.utcfromtimestamp(ts_ms // 1000).isoformat()
 
-def row_dict(row: pd.Series) -> dict:
-    return {
-        "ts": int(row.ts), "open": float(row.open), "close": float(row.close),
-        "high": float(row.high), "low": float(row.low), "vol": float(row.vol),
-        "ema20": float(row.ema20), "ema50": float(row.ema50),
-        "ema200": float(row.ema200), "rsi14": float(row.rsi14),
-        "vwap": float(row.vwap), "atr14": float(row.atr14),
-        "vol_mean20": float(row.vol_mean20)
-    }
 
-def update_gist(token: str, gist_id: str, file_name: str, payload: dict) -> None:
+def row_dict(r: pd.Series) -> dict:
+    return {k: float(v) if isinstance(v, (int, float)) else v for k, v in r.items()}
+
+
+def push_gist(token: str, gist_id: str, file_name: str, payload: dict) -> None:
     hdr  = {"Authorization": f"token {token}",
             "Accept": "application/vnd.github+json"}
     body = {"files": {file_name: {"content": json.dumps(payload, separators=(',', ':'))}}}
-    r = requests.patch(f"https://api.github.com/gists/{gist_id}",
-                       headers=hdr, json=body, timeout=10)
-    r.raise_for_status()
+    resp = requests.patch(f"https://api.github.com/gists/{gist_id}",
+                          headers=hdr, json=body, timeout=10)
+    resp.raise_for_status()
 
-# ---------- main -----------------------------------------------------------
+
+# ─────────────────────────────────── main ────────────────────────────────────
 def main() -> None:
-    symbol  = os.getenv("SYMBOL", "SOLAYER-USDT")
-    token   = os.environ["GIST_TOKEN"]
+    symbol  = os.getenv("SYMBOL",       "SOLAYER-USDT")
+    tf      = os.getenv("GRANULARITY",  DEFAULT_TF)
     gist_id = os.environ["GIST_ID"]
-    f_name  = os.getenv("FILE_NAME", DEFAULT_FILE)
+    token   = os.environ["GIST_TOKEN"]
+    f_name  = os.getenv("FILE_NAME",    DEFAULT_FILE_NAME)
 
-    df   = fetch_frame(symbol, TF)
+    df   = fetch_frame(symbol, tf)
     last = df.iloc[-1]
 
     payload = {
-        "timestamp": int(last.ts),
-        "datetime_utc": iso(last.ts),
-        "symbol": symbol, "granularity": TF,
+        # snapshotveld
+        "timestamp":   int(last.ts),
+        "datetime_utc": iso(int(last.ts)),
+        "symbol":      symbol,
+        "granularity": tf,
 
-        # snapshot-velden
-        "price": float(last.close), "high": float(last.high),
-        "low": float(last.low),    "vol": float(last.vol),
-        "ema20": float(last.ema20), "ema50": float(last.ema50),
-        "ema200": float(last.ema200), "rsi14": float(last.rsi14),
-        "vwap": float(last.vwap),   "atr14": float(last.atr14),
-        "vol_mean20": float(last.vol_mean20),
+        **row_dict(last),                        # price / indics / vol …
 
-        # volledige history (laatste 300 stuks)
+        # volledige history
         "last_300_candles": [row_dict(r) for _, r in df.iterrows()],
 
         # placeholders
-        "funding_rate": None, "open_interest": None, "order_book": None,
+        "funding_rate":  None,
+        "open_interest": None,
+        "order_book":    None,
 
-        "generated_at": int(time.time()*1000)
+        "generated_at":  iso(int(time.time() * 1000))
     }
 
-    update_gist(token, gist_id, f_name, payload)
-    print("✅  300-candle feed geüpload:", iso(int(time.time()*1000)))
+    push_gist(token, gist_id, f_name, payload)
+    print("✅  feed uploaded", payload["generated_at"])
+
 
 if __name__ == "__main__":
     main()
