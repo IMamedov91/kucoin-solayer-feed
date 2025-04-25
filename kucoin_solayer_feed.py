@@ -1,116 +1,32 @@
 #!/usr/bin/env python3
 """
-kucoin_solayer_feed.py – enhanced (timestamp‑fix)
-=================================================
-Same functionality as previous commit, **but timestamps are now 100 % correct** and the deprecation‑warning is removed.
-
-Highlights
-----------
-* KuCoin returns candle‑time in **seconds**; we convert to **milliseconds** (`*1000`).
-* Helper `utc_iso(ts_ms)` gives a readable ISO‑8601 string with explicit **UTC offset**.
-* Replaced deprecated `datetime.utcfromtimestamp`.
-
-JSON example
-------------
-```json
-{
-  "timestamp": 1745793600000,
-  "symbol": "SOLAYER-USDT",
-  "latest_candle": {
-    "ts": 1745792700000,
-    "iso": "2025-04-27T14:25:00+00:00",
-    "open": 2.2325,
-    …
-  },
-  …
-}
-```
+kucoin_solayer_feed.py – uitgebreid: schrijft laatste candle + indicator snapshot
 """
+import os, json, datetime as _dt, requests, pandas as pd
+import ta  #  pip install ta pandas
 
-import os
-import json
-import datetime as dt
-from typing import List, Dict, Any
-import requests
+KUCOIN_URL = "https://api.kucoin.com/api/v1/market/candles"
 
-BASE = "https://api.kucoin.com"
-
-# ---------- helpers ---------------------------------------------------------
-
-def ts_ms() -> int:
-    """Current UTC timestamp in **milliseconds**."""
-    return int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)
-
-
-def utc_iso(ts_ms: int) -> str:
-    """Return ISO‑8601 string (UTC) from ms‑epoch."""
-    return dt.datetime.fromtimestamp(ts_ms / 1000, tz=dt.timezone.utc).isoformat()
-
-
-def get(endpoint: str, params: dict[str, Any] | None = None):
-    r = requests.get(f"{BASE}{endpoint}", params=params, timeout=10)
+def fetch_frame(symbol: str, granularity: str, limit: int = 300) -> pd.DataFrame:
+    params = {"symbol": symbol, "type": granularity, "limit": limit}
+    r = requests.get(KUCOIN_URL, params=params, timeout=10)
     r.raise_for_status()
-    return r.json()
+    cols = ["ts", "open", "close", "high", "low", "vol", "turnover"]
+    df = pd.DataFrame(r.json()["data"], columns=cols).astype(float)
+    df["ts"] = df["ts"].astype(int)
+    df.sort_values("ts", inplace=True)
 
-# ---------- core fetches ----------------------------------------------------
+    # ---- indicatoren ----
+    df["ema20"]  = ta.trend.ema_indicator(df["close"], 20)
+    df["ema50"]  = ta.trend.ema_indicator(df["close"], 50)
+    df["ema200"] = ta.trend.ema_indicator(df["close"], 200)
+    df["rsi14"]  = ta.momentum.rsi(df["close"], 14)
+    df["vwap"]   = ta.volume.volume_weighted_average_price(
+                      df["high"], df["low"], df["close"], df["vol"], 14)
+    df["vol_mean20"] = df["vol"].rolling(20).mean()
+    return df
 
-def fetch_candles(symbol: str, tf: str, limit: int = 20) -> List[Dict]:
-    data = get("/api/v1/market/candles", {"symbol": symbol, "type": tf})["data"]
-    if not data:
-        raise RuntimeError("No candles returned")
-    candles = []
-    for raw in data[:limit][::-1]:  # newest→oldest → reverse
-        ts_ms_val = int(raw[0]) * 1000  # KuCoin gives seconds → convert to ms
-        candles.append(
-            {
-                "ts": ts_ms_val,
-                "iso": utc_iso(ts_ms_val),
-                "open": float(raw[1]),
-                "close": float(raw[2]),
-                "high": float(raw[3]),
-                "low": float(raw[4]),
-                "vol": float(raw[5]),
-            }
-        )
-    return candles
-
-
-def fetch_funding(symbol: str):
-    try:
-        d = get("/api/v1/funding-rate/symbol", {"symbol": symbol})["data"]
-        return {
-            "rate": float(d["fundingRate"]),
-            "next_time": int(d["nextSettleTime"]),
-            "next_time_iso": utc_iso(int(d["nextSettleTime"]))
-        }
-    except Exception:
-        return None
-
-
-def fetch_open_interest(symbol: str):
-    try:
-        d = get("/api/v1/openInterest", {"symbol": symbol})["data"]
-        return float(d["openInterestVolume"])
-    except Exception:
-        return None
-
-
-def fetch_depth(symbol: str, pct: float = 0.2):
-    try:
-        depth = get("/api/v1/market/orderbook/level2_20", {"symbol": symbol})["data"]
-        bids = [(float(p), float(q)) for p, q in depth["bids"]]
-        asks = [(float(p), float(q)) for p, q in depth["asks"]]
-        mid = (bids[0][0] + asks[0][0]) / 2
-        thresh = mid * pct / 100
-        bid_vol = sum(q for p, q in bids if mid - p <= thresh)
-        ask_vol = sum(q for p, q in asks if p - mid <= thresh)
-        return {"bid_vol": bid_vol, "ask_vol": ask_vol}
-    except Exception:
-        return None
-
-# ---------- gist update -----------------------------------------------------
-
-def update_gist(token: str, gist_id: str, file_name: str, payload: dict) -> bool:
+def update_gist(token: str, gist_id: str, file_name: str, payload: dict):
     url = f"https://api.github.com/gists/{gist_id}"
     headers = {
         "Authorization": f"token {token}",
@@ -118,36 +34,34 @@ def update_gist(token: str, gist_id: str, file_name: str, payload: dict) -> bool
         "User-Agent": "solayer-feed-bot"
     }
     body = {"files": {file_name: {"content": json.dumps(payload, separators=(',', ':'))}}}
-    r = requests.patch(url, headers=headers, json=body, timeout=10)
-    r.raise_for_status()
-    return r.status_code == 200
-
-# ---------- main ------------------------------------------------------------
+    resp = requests.patch(url, headers=headers, json=body, timeout=10)
+    resp.raise_for_status()
+    return resp.ok
 
 def main():
-    symbol = os.getenv("SYMBOL", "SOLAYER-USDT")
-    tf = os.getenv("GRANULARITY", "15min")
-    token = os.environ["GIST_TOKEN"]
-    gist_id = os.environ["GIST_ID"]
-    file_name = os.getenv("FILE_NAME", "solayer_feed.json")
-    depth_pct = float(os.getenv("DEPTH_PCT", 0.2))
+    symbol      = os.getenv("SYMBOL",      "SOLAYER-USDT")
+    granularity = os.getenv("GRANULARITY", "15min")
+    token       = os.environ["GIST_TOKEN"]
+    gist_id     = os.environ["GIST_ID"]
+    file_name   = os.getenv("FILE_NAME",   "solayer_feed.json")
 
-    candles = fetch_candles(symbol, tf, 20)
-
+    df   = fetch_frame(symbol, granularity)
+    last = df.iloc[-1]
     payload = {
-        "timestamp": ts_ms(),
-        "iso": utc_iso(ts_ms()),
-        "symbol": symbol,
-        "granularity": tf,
-        "latest_candle": candles[-1],
-        "last_20_candles": candles,
-        "funding_rate": fetch_funding(symbol),
-        "open_interest": fetch_open_interest(symbol),
-        "order_book": fetch_depth(symbol, depth_pct)
+        "timestamp": int(last.ts),
+        "datetime_utc": _dt.datetime.utcfromtimestamp(int(last.ts/1000)).isoformat(),
+        "price":   float(last.close),
+        "high":    float(last.high),
+        "low":     float(last.low),
+        "vol":     float(last.vol),
+        "ema20":   float(last.ema20),
+        "ema50":   float(last.ema50),
+        "ema200":  float(last.ema200),
+        "rsi14":   float(last.rsi14),
+        "vwap":    float(last.vwap),
+        "vol_mean20": float(last.vol_mean20)
     }
-
-    print("Upload success" if update_gist(token, gist_id, file_name, payload) else "Upload failed")
-
+    update_gist(token, gist_id, file_name, payload)
 
 if __name__ == "__main__":
     main()
