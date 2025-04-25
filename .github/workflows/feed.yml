@@ -17,7 +17,7 @@ jobs:
 
       # ▼ install nu ALLE packages die het script nodig heeft
       - name: Install dependencies
-        run: pip install --upgrade pip && pip install requests pandas ta
+      - run: pip install requests ta pandas
 
       - name: Run feed-script
         run: python kucoin_solayer_feed.py
