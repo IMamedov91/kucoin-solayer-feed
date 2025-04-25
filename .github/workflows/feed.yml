@@ -1,8 +1,8 @@
 name: KuCoin Solayer feed
 
 on:
-  schedule:      # elke 15 min (UTC)
-    - cron: "*/15 * * * *"
+  schedule:
+    - cron: "*/15 * * * *"   # elke 15 min
   workflow_dispatch:
 
 jobs:
@@ -10,31 +10,28 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Repo klonen
-      - uses: actions/checkout@v4
+    - uses: actions/checkout@v4
 
-      # 2. Python klaarzetten (3.11 is stabiel voor pandas 2.x)
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
 
-      # 3. (optioneel) cache pip-packages voor snellere runs
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: ${{ runner.os }}-pip-
+    # ✔  snellere install: pip-cache op sha256 van requirements.txt
+    - name: Cache pip
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
 
-      # 4. Dependencies installeren
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install --no-cache-dir -r requirements.txt
+    - name: Install deps
+      run: |
+        python -m pip install --upgrade pip
+        pip install --no-cache-dir -r requirements.txt
 
-      # 5. Feed genereren en naar Gist pushen
-      - name: Update Gist feed
-        env:
-          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
-          GIST_ID:    cae271a238f04de0fe7359f03490bc5b
-        run: python kucoin_solayer_feed.py
+    - name: Update Gist feed
+      env:
+        GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+        GIST_ID:    cae271a238f04de0fe7359f03490bc5b
+      run: python kucoin_solayer_feed.py
