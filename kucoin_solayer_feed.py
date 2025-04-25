@@ -1,65 +1,68 @@
 #!/usr/bin/env python3
 """
-kucoin_solayer_feed.py – v5  (robuste, JSON-safe 300-candle feed)
-
-• Paginatie over KuCoin-API (max 150 candles per call) tot ≥300 candles
-• Berekent EMA20/50/200, RSI14, VWAP, ATR14, vol_mean20
-• Verandert alle NaN/inf → None (json-safe)  –  allow_nan=False
-• Schrijft snapshot + volledige history naar GitHub Gist
+kucoin_solayer_feed.py — v5-stable
+• verzamelt ≥300 × 15-min-candles (KuCoin levert max 150 per call)
+• berekent EMA-20/50/200, RSI-14, VWAP, ATR-14, vol_mean20
+• JSON-safe: NaN/inf ⇒ null (allow_nan=False)
+• uploadt snapshot + volledige history naar GitHub Gist
 """
 
 from __future__ import annotations
-import os, json, time, math, datetime as dt
-import requests, pandas as pd, ta
+import os, json, math, time, datetime as dt, typing as t
 
-API_URL        = "https://api.kucoin.com/api/v1/market/candles"
-HISTORY        = 300           # gewenste candles
-SEC_PER_CANDLE = 15 * 60       # 15-min
-TF_DEFAULT     = "15min"
-FILE_DEFAULT   = "solayer_feed.json"
+import requests
+import pandas as pd
+import ta
 
-pd.options.mode.copy_on_write = True   # suppress pandas warnings
+API_URL         = "https://api.kucoin.com/api/v1/market/candles"
+HISTORY         = 300              # gewenste lengte
+SEC_PER_CANDLE  = 15 * 60
+TF_DEFAULT      = "15min"
+FILE_DEFAULT    = "solayer_feed.json"
+
+pd.options.mode.copy_on_write = True
 
 
-# ────────────────────────── helpers ──────────────────────────
+# ──────────────────────── helpers ────────────────────────
 def _fetch_batch(symbol: str, tf: str, *, limit: int = 150,
-                 end_at: int | None = None, tries: int = 3) -> list[list[float]]:
-    """ Eén API-call met eenvoudige retry-logica (HTTP errors / timeouts). """
+                 end_at: int | None = None, retries: int = 3) -> list[list[t.Any]]:
+    """Eén KuCoin-request met eenvoudige retry-logica."""
     params = {"symbol": symbol, "type": tf, "limit": limit}
     if end_at:
-        params["endAt"] = end_at          # KuCoin expects seconds
-    for _ in range(tries):
+        params["endAt"] = end_at
+    exc: Exception | None = None
+    for _ in range(retries):
         try:
             r = requests.get(API_URL, params=params, timeout=10)
             r.raise_for_status()
             return r.json()["data"]
         except Exception as e:
-            last = e
+            exc = e
             time.sleep(1)
-    raise RuntimeError(f"KuCoin batch‐request faalt na {tries} pogingen: {last}")
+    raise RuntimeError(f"KuCoin-API bleef falen: {exc}") from exc
 
 
 def fetch_frame(symbol: str, tf: str) -> pd.DataFrame:
-    """Haalt minstens `HISTORY` candles op via paginatie (nieuw → oud)."""
+    """Haalt minstens `HISTORY` candles op via paginatie."""
     raw, got, end_at = [], 0, None
     while got < HISTORY:
-        chunk = _fetch_batch(symbol, tf, limit=150, end_at=end_at)
+        chunk = _fetch_batch(symbol, tf, end_at=end_at)
         if not chunk:
             break
         raw.extend(chunk)
         got += len(chunk)
-        # volgende iteratie: eindpunt 1 candle vóór oudste
         oldest_ms = float(chunk[-1][0])
         end_at = int(oldest_ms / 1000 - SEC_PER_CANDLE - 1)
 
     cols = ["ts", "open", "close", "high", "low", "vol", "turnover"]
     df = pd.DataFrame(raw, columns=cols).astype(float)
+
     df["ts"] = df["ts"].astype(int)
     df.sort_values("ts", inplace=True)
     df.drop_duplicates("ts", keep="last", inplace=True)
-    df = df.tail(HISTORY).reset_index(drop=True)   # precies 300
+    df = df.tail(HISTORY).reset_index(drop=True)
 
-    # ── indicatoren
+    # indicatoren
     df["ema20"]   = ta.trend.ema_indicator(df["close"], 20)
     df["ema50"]   = ta.trend.ema_indicator(df["close"], 50)
     df["ema200"]  = ta.trend.ema_indicator(df["close"], 200)
@@ -72,74 +75,61 @@ def fetch_frame(symbol: str, tf: str) -> pd.DataFrame:
     return df
 
 
-def iso(ts_ms: int) -> str:
-    # tijdzone-bewust (UTC) → geen DeprecationWarning meer
-    return dt.datetime.fromtimestamp(ts_ms / 1000, dt.timezone.utc).isoformat()
+def iso(ms: int) -> str:
+    return dt.datetime.fromtimestamp(ms / 1000, dt.timezone.utc).isoformat(timespec="seconds")
 
 
-def sanitize(v: float) -> float | None:
-    return None if (isinstance(v, float) and (math.isnan(v) or math.isinf(v))) else v
+def _clean(v: float | int) -> float | int | None:
+    return None if isinstance(v, float) and (math.isnan(v) or math.isinf(v)) else v
 
 
-def row_to_dict(row: pd.Series) -> dict:
-    d = {k: sanitize(v) for k, v in row.items()}
-    d["ts"] = int(d["ts"])                # ts als int behouden
+def row_dict(row: pd.Series) -> dict:
+    d = {k: _clean(v) for k, v in row.items()}
+    d["ts"] = int(d["ts"])
     return d
 
 
-def push_gist(token: str, gist_id: str, filename: str, payload: dict) -> None:
+def push_gist(token: str, gist_id: str, fname: str, payload: dict) -> None:
     headers = {"Authorization": f"token {token}",
                "Accept": "application/vnd.github+json"}
-    body = {"files": {filename: {
+    body = {"files": {fname: {
             "content": json.dumps(payload, separators=(',', ':'), allow_nan=False)}}}
-    resp = requests.patch(f"https://api.github.com/gists/{gist_id}",
-                          headers=headers, json=body, timeout=10)
-    resp.raise_for_status()
+    r = requests.patch(f"https://api.github.com/gists/{gist_id}",
+                       headers=headers, json=body, timeout=10)
+    r.raise_for_status()
 
 
-# ─────────────────────────── main ────────────────────────────
+# ─────────────────────────── main ──────────────────────────
 def main() -> None:
-    symbol   = os.getenv("SYMBOL",      "SOLAYER-USDT")
-    tf       = os.getenv("GRANULARITY", TF_DEFAULT)
-    gist_id  = os.environ["GIST_ID"]
-    token    = os.environ["GIST_TOKEN"]
-    filename = os.getenv("FILE_NAME",   FILE_DEFAULT)
+    symbol  = os.getenv("SYMBOL",      "SOLAYER-USDT")
+    tf      = os.getenv("GRANULARITY", TF_DEFAULT)
+    gist_id = os.environ["GIST_ID"]
+    token   = os.environ["GIST_TOKEN"]
+    fname   = os.getenv("FILE_NAME",   FILE_DEFAULT)
 
     df   = fetch_frame(symbol, tf)
     last = df.iloc[-1]
 
     payload = {
-        "timestamp":   int(last.ts),
+        "timestamp":    int(last.ts),
         "datetime_utc": iso(last.ts),
-        "symbol":      symbol,
-        "granularity": tf,
+        "symbol":       symbol,
+        "granularity":  tf,
 
-        # snapshot
-        "price": sanitize(last.close),
-        "high":  sanitize(last.high),
-        "low":   sanitize(last.low),
-        "vol":   sanitize(last.vol),
-        "ema20": sanitize(last.ema20),
-        "ema50": sanitize(last.ema50),
-        "ema200":sanitize(last.ema200),
-        "rsi14": sanitize(last.rsi14),
-        "vwap":  sanitize(last.vwap),
-        "atr14": sanitize(last.atr14),
-        "vol_mean20": sanitize(last.vol_mean20),
+        "price": _clean(last.close),  "high": _clean(last.high),
+        "low": _clean(last.low),      "vol":  _clean(last.vol),
+        "ema20": _clean(last.ema20),  "ema50": _clean(last.ema50),
+        "ema200": _clean(last.ema200),"rsi14": _clean(last.rsi14),
+        "vwap": _clean(last.vwap),    "atr14": _clean(last.atr14),
+        "vol_mean20": _clean(last.vol_mean20),
 
-        # volledige history
-        "last_300_candles": [row_to_dict(r) for _, r in df.iterrows()],
-
-        # placeholders
-        "funding_rate": None,
-        "open_interest": None,
-        "order_book": None,
-
+        "last_300_candles": [row_dict(r) for _, r in df.iterrows()],
+        "funding_rate": None, "open_interest": None, "order_book": None,
         "generated_at": iso(int(time.time() * 1000))
     }
 
-    push_gist(token, gist_id, filename, payload)
-    print("✅  300-candle feed geüpload:", payload["generated_at"])
+    push_gist(token, gist_id, fname, payload)
+    print("✅  feed geüpload", payload["generated_at"])
 
 
 if __name__ == "__main__":
