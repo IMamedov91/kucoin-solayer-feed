@@ -10,15 +10,15 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1️⃣ Repo klonen
+      # 1️Repo klonen
       - uses: actions/checkout@v4
 
-      # 2️⃣ Python 3.11 installeren (compatibel met pandas 2.x)
+      # 2️ Python 3.11 installeren (compatibel met pandas 2.x)
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # 3️⃣ Dependencies installeren (robuust)
+      # 3️ Dependencies installeren (robuust)
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
@@ -30,7 +30,7 @@ jobs:
             pip install --no-cache-dir pandas ta requests
           fi
 
-      # 4️⃣ Feed genereren & pushen
+      # 4️ Feed genereren & pushen
       - name: Update Gist feed
         env:
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
