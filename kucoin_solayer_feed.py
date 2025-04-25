@@ -68,6 +68,12 @@ def update_gist(token: str, gist_id: str, file_name: str, payload: dict) -> None
     resp = requests.patch(url, headers=headers, json=body, timeout=10)
     resp.raise_for_status()     # → except bij fout
 
+def to_datetime(ts_raw):
+    """Converteer ts ongeacht of het s of ms is."""
+    ts_raw = int(ts_raw)
+    if ts_raw > 1e12:          # 13-digits → ms
+        ts_raw //= 1000
+    return _dt.datetime.utcfromtimestamp(ts_raw).isoformat()
 
 # ---------- main ------------------------------------------------------------
 def main() -> None:
@@ -76,14 +82,15 @@ def main() -> None:
     token       = os.environ["GIST_TOKEN"]
     gist_id     = os.environ["GIST_ID"]
     file_name   = os.getenv("FILE_NAME", FILE_DEFAULT)
+            
 
-    df   = fetch_frame(symbol, granularity)
+    df   = fetch_frame(symbol, granularity, limit=1000)
     last = df.iloc[-1]
 
     payload = {
         # ---- snapshot van meest recente candle + indicatoren ----
         "timestamp": int(last.ts),
-        "datetime_utc": _dt.datetime.utcfromtimestamp(int(last.ts / 1000)).isoformat(),
+        "datetime_utc": to_datetime(last.ts),
         "price":   float(last.close),
         "high":    float(last.high),
         "low":     float(last.low),
