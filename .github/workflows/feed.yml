@@ -1,26 +1,34 @@
 name: KuCoin Solayer feed
 
 on:
+  # elke 5 minuten
   schedule:
-    - cron: '*/5 * * * *'        # elke 5 minuten
+    - cron: '*/5 * * * *'
+  # handmatig starten vanuit Actions-tab
   workflow_dispatch:
 
 jobs:
   push-feed:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      # 1. repo uitchecken
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      # 2. Python installeren
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.11'   # 3.11 is lichter & sneller op GH-runners
+          python-version: '3.x'
 
-      # ▼ install nu ALLE packages die het script nodig heeft
-      - name: Install dependencies
-      - run: pip install requests ta pandas
+      # 3. dependencies
+      - name: Install deps
+        run: pip install requests ta pandas
 
-      - name: Run feed-script
+      # 4. script draaien
+      - name: Run feed script
         run: python kucoin_solayer_feed.py
         env:
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
-          GIST_ID:  cae271a238f04de0fe7359f03490bc5b
+          GIST_ID: cae271a238f04de0fe7359f03490bc5b
