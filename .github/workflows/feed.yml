@@ -40,6 +40,6 @@ jobs:
           # =====  configurable feed-parameters  =====
           ENDPOINT:    futures          # "spot"  of  "futures"
           SYMBOL:      SOLAYERUSDTM     # futures-symbool; spot = SOLAYER-USDT
-          GRANULARITY: "900"            # 900 s = 15 min voor futures; spot = 15min
+          GRANULARITY: "15"            # 900 s = 15 min voor futures; spot = 15min
           FILE_NAME:   solayer_feed.json
         run: python kucoin_solayer_feed.py
