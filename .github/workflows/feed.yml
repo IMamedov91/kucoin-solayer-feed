@@ -22,7 +22,7 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
+          if [ -s requirements.txt ]; then          #  -s  ⇒ bestand bestaat én >0 bytes
             echo "using requirements.txt"
             pip install --no-cache-dir -r requirements.txt
           else
