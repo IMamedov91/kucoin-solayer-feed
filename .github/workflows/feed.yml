@@ -48,8 +48,8 @@ jobs:
     - name: Update SOLayer Gist feed
       env:
         # ─ verplichte secrets ─
-        GIST_TOKEN:  ${{ secrets.GIST_TOKEN_SOLAYER }}   # PAT met 'gist' scope
-        GIST_ID:     ${{ secrets.GIST_ID_SOLAYER }}      # ID van de SOLayer-gist
+        GIST_TOKEN:  ${{ secrets.GIST_TOKEN }}   # PAT met 'gist' scope
+        GIST_ID:     ${{ secrets.GIST_ID }}      # ID van de SOLayer-gist
 
         # ─ feed-parameters ─
         ENDPOINT:    futures           # 'spot' of 'futures'
