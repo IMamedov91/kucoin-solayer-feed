@@ -1,45 +1,59 @@
-name: KuCoin Solayer feed
+name: KuCoin SOLayer feed
 
 on:
   schedule:
-    - cron: "*/15 * * * *"      # elke 15 min (UTC)
-  workflow_dispatch:            # handmatig triggeren
+    # elke 15 min in UTC
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: kucoin-solayer-feed            # voorkomt overlappende runs
+  cancel-in-progress: true              # laatste run wint
 
 jobs:
   push-feed:
     runs-on: ubuntu-latest
 
     steps:
-      # 1 – Repository klonen
-      - uses: actions/checkout@v4
+    # 1 – Repo klonen
+    - uses: actions/checkout@v4
 
-      # 2 – Python 3.11 klaarzetten
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+    # 2 – Python 3.11 klaarzetten
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'          # pin exacte minor-versie
 
-      # 3 – Dependencies installeren
-      - name: Install Python dependencies
-        run: |
-          python -m pip install --upgrade pip
-          if [ -s requirements.txt ]; then
-            echo "▶ installing from requirements.txt"
-            pip install --no-cache-dir -r requirements.txt
-          else
-            echo "▶ installing fallback packages"
-            pip install --no-cache-dir pandas ta requests
-          fi
+    # 3 – pip-cache (sneller)
+    - name: Cache pip downloads
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
 
-      # 4 – Feed genereren & Gist bijwerken
-      - name: Update Gist feed
-        env:
-          # verplichte secrets
-          GIST_TOKEN:  ${{ secrets.GIST_TOKEN }}
-          GIST_ID:     ${{ secrets.GIST_ID }}
+    # 4 – Dependencies installeren
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip
+        if [ -s requirements.txt ]; then
+          echo "▶ installing from requirements.txt"
+          pip install --no-cache-dir -r requirements.txt
+        else
+          echo "▶ installing fallback packages"
+          pip install --no-cache-dir pandas ta requests
+        fi
 
-          # =====  configurable feed-parameters  =====
-          ENDPOINT:    futures          # "spot"  of  "futures"
-          SYMBOL:      SOLAYERUSDTM     # futures-symbool; spot = SOLAYER-USDT
-          GRANULARITY: "15"            # 900 s = 15 min voor futures; spot = 15min
-          FILE_NAME:   solayer_feed.json
-        run: python kucoin_solayer_feed.py
+    # 5 – Feed genereren & Gist bijwerken
+    - name: Update SOLayer Gist feed
+      env:
+        # ─ verplichte secrets ─
+        GIST_TOKEN:  ${{ secrets.GIST_TOKEN_SOLAYER }}   # PAT met 'gist' scope
+        GIST_ID:     ${{ secrets.GIST_ID_SOLAYER }}      # ID van de SOLayer-gist
+
+        # ─ feed-parameters ─
+        ENDPOINT:    futures           # 'spot' of 'futures'
+        SYMBOL:      SOLAYERUSDTM
+        GRANULARITY: '15'              # futures: 15 min
+        FILE_NAME:   solayer_feed.json
+      run: python kucoin_solayer_feed.py
