@@ -1,134 +1,121 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-kucoin_solayer_feed.py — v1.2  (TAAPI edition)
+solayer_feed_taapi.py — v1.3  🚀
 
-• Haalt 15-min-indicatoren (EMA20/50/200, RSI14, ATR14, VWAP) via TAAPI.io
-  voor Binance-pair LAYER/USDT.
-• Levert exact dezelfde JSON-structuur als de BTC-feed.
-• Bulk-endpoint ⇒ max 20 candles per indicator (meer kan met Direct).
+* Haalt **300** 15‑min OHLCV‑candles via TAAPI `/candles`.
+* Berekent EMA20/50/200, RSI14, ATR14, VWAP lokaal (pandas + ta) zodat er nooit `null`‑waarden zijn.
+* Voegt funding‑rate & open‑interest (Binance futures) toe voor LAYERUSDT.
+* Uploadt JSON‑payload naar GitHub Gist in het overeengekomen schema.
 """
 
 from __future__ import annotations
-import datetime as dt, json, os, sys, time
-from typing import Any, Dict, List
+import datetime as dt, json, os, sys, time, typing as t
 
+import pandas as pd
 import requests
+import ta
 
-# ──────────────────────────── CONFIG ─────────────────────────────
-SECRET     = os.getenv("TAAPI_SECRET") or sys.exit("❌ TAAPI_SECRET ontbreekt")
-GIST_ID    = os.getenv("GIST_ID")      or sys.exit("❌ GIST_ID ontbreekt")
-GIST_TOKEN = os.getenv("GIST_TOKEN")   or sys.exit("❌ GIST_TOKEN ontbreekt")
+# ---------- CONFIG ----------
+SECRET      = os.getenv("TAAPI_SECRET")  or sys.exit("❌ TAAPI_SECRET ontbreekt")
+GIST_ID     = os.getenv("GIST_ID")       or sys.exit("❌ GIST_ID ontbreekt")
+GIST_TOKEN  = os.getenv("GIST_TOKEN")    or sys.exit("❌ GIST_TOKEN ontbreekt")
 
-SYMBOL       = os.getenv("SYMBOL", "LAYER/USDT")   # TAAPI-formaat
-INTERVAL     = os.getenv("GRANULARITY", "15m")     # '15m', '1h', …
-SNAP_LEN     = 300                                 # target snapshot (20 geleverd)
-FILE_NAME    = os.getenv("FILE_NAME", "solayer_feed.json")
-TAAPI_BULK   = "https://api.taapi.io/bulk"
+SYMBOL      = os.getenv("SYMBOL", "LAYER/USDT")   # TAAPI‐format
+INTERVAL    = os.getenv("GRANULARITY", "15m")
+SNAP_LEN    = int(os.getenv("SNAP_LEN", "300"))
+FILE_NAME   = os.getenv("FILE_NAME", "solayer_feed.json")
 
-iso = lambda ms: dt.datetime.utcfromtimestamp(ms/1000).isoformat(timespec="seconds") + "Z"
+TA_BASE     = "https://api.taapi.io"
 
-# ─────────────────────── TAAPI CALL ──────────────────────────────
-def fetch_indicators() -> List[Dict[str, Any]]:
-    inds = [
-        {"id": "ema20",  "indicator": "ema", "optInTimePeriod": 20},
-        {"id": "ema50",  "indicator": "ema", "optInTimePeriod": 50},
-        {"id": "ema200", "indicator": "ema", "optInTimePeriod": 200},
-        {"id": "rsi14",  "indicator": "rsi", "optInTimePeriod": 14},
-        {"id": "atr14",  "indicator": "atr", "optInTimePeriod": 14},
-        {"id": "vwap",   "indicator": "vwap","anchorPeriod": "session"},
-    ]
-    for ind in inds:
-        ind.update({"addResultTimestamp": True, "results": 20})
+def iso(ms: int) -> str:
+    return dt.datetime.utcfromtimestamp(ms/1000).isoformat(timespec="seconds") + "Z"
 
-    payload = {
-        "secret": SECRET,
-        "construct": {
-            "exchange": "binance",
-            "symbol":   SYMBOL,
-            "interval": INTERVAL,
-            "indicators": inds,
-        },
+
+# ---------- TAAPI helpers ----------
+def taapi_candles(backtrack: int) -> pd.DataFrame:
+    """Download `backtrack` candles via TAAPI."""
+    params = {
+        "secret":   SECRET,
+        "exchange": "binance",
+        "symbol":   SYMBOL,
+        "interval": INTERVAL,
+        "backtrack": backtrack
     }
+    r = requests.get(f"{TA_BASE}/candles", params=params, timeout=10)
+    if r.status_code == 401:
+        sys.exit("❌ TAAPI 401 Unauthorized – controleer je API‑key en plan.")
+    r.raise_for_status()
+    data = r.json()["data"]
+    if not data:
+        sys.exit("❌ Geen candle‑data terug van TAAPI – controleer symbol of interval.")
+    df = pd.DataFrame(data)
+    df.rename(columns={"timestamp": "ts", "volume": "vol"}, inplace=True)
+    df = df.astype(float, errors="ignore").sort_values("ts").reset_index(drop=True)
+    return df.tail(backtrack)
 
-    resp = requests.post(TAAPI_BULK, json=payload, timeout=10)
-    if resp.status_code == 401:
-        sys.exit("❌ TAAPI 401 Unauthorized – controleer je API-key en plan.")
-    resp.raise_for_status()
-    return resp.json()["data"]
+# ---------- macro ----------
+def funding_and_oi() -> tuple[float|None, float|None]:
+    try:
+        fr = requests.get("https://fapi.binance.com/fapi/v1/fundingRate",
+                          params={"symbol":"LAYERUSDT","limit":1}, timeout=10).json()[0]
+        oi = requests.get("https://fapi.binance.com/futures/data/openInterestHist",
+                          params={"symbol":"LAYERUSDT","period":"5m","limit":1}, timeout=10).json()[0]
+        return float(fr["fundingRate"]), float(oi["sumOpenInterest"])
+    except Exception:
+        return None, None
 
-# ───────────────────────── RESHAPE ───────────────────────────────
-def reshape(data: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Combineert alle indicator-arrays op timestamp-index.
-    Werkt voor zowel scalar ('timestamp': 161..) als array ('timestamp': [..]) payloads.
-    """
-    bars: Dict[int, Dict[str, Any]] = {}
+# ---------- indicator calculation ----------
+def enrich_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df["ema20"]  = ta.trend.ema_indicator(df["close"], 20)
+    df["ema50"]  = ta.trend.ema_indicator(df["close"], 50)
+    df["ema200"] = ta.trend.ema_indicator(df["close"], 200)
+    df["rsi14"]  = ta.momentum.rsi(df["close"], 14)
+    df["atr14"]  = ta.volatility.average_true_range(df["high"], df["low"], df["close"], 14)
+    df["vwap"]   = ta.volume.volume_weighted_average_price(df["high"], df["low"],
+                                                           df["close"], df["vol"], 14)
+    return df
 
-    for item in data:
-        ind_id = item["id"]
-        res    = item["result"]
-
-        # 1) Wanneer TAAPI arrays terugstuurt  (results >= 2)
-        if isinstance(res.get("timestamp"), list):
-            for i, ts in enumerate(res["timestamp"]):
-                ts = int(ts)
-                cell = bars.setdefault(ts, {})
-                cell[ind_id] = res["value"][i]
-                for k in ("open", "close", "high", "low", "volume"):
-                    vlist = res.get(k)
-                    if vlist:
-                        cell.setdefault(k, vlist[i])
-
-        # 2) Enkelvoudige payload (backwards-compat)
-        else:
-            ts = int(res.get("timestamp") or res.get("timestampMs"))
-            cell = bars.setdefault(ts, {})
-            cell[ind_id] = res["value"]
-            for k in ("open", "close", "high", "low", "volume"):
-                v = res.get(k)
-                if v is not None:
-                    cell.setdefault(k, v)
-
-    if not bars:
-        sys.exit("❌ Geen bruikbare data van TAAPI ontvangen – check symbol/plan.")
-
-    ordered = [{"ts": t, **vals} for t, vals in sorted(bars.items())][-SNAP_LEN:]
-    last    = ordered[-1]
-
-    return {
-        "timestamp":    last["ts"],
-        "datetime_utc": iso(last["ts"]),
-        "symbol":       SYMBOL.replace("/", ""),
-        "granularity":  INTERVAL,
-        "price":        last.get("close"),
-        "high":         last.get("high"),
-        "low":          last.get("low"),
-        "vol":          last.get("volume"),
-        "ema20":        last.get("ema20"),
-        "ema50":        last.get("ema50"),
-        "ema200":       last.get("ema200"),
-        "rsi14":        last.get("rsi14"),
-        "vwap":         last.get("vwap"),
-        "atr14":        last.get("atr14"),
-        "last_300_candles": ordered,   # bevat tot 20 candles (TAAPI-limiet)
-        "funding_rate":  None,
-        "open_interest": None,
-        "order_book":    None,
-        "generated_at":  iso(int(time.time()*1000)),
-    }
-
-# ────────────────────── PUSH TO GIST ─────────────────────────────
-def push_gist(payload: Dict[str, Any]) -> None:
+# ---------- Gist push ----------
+def push_gist(payload: dict) -> None:
     headers = {"Authorization": f"token {GIST_TOKEN}",
                "Accept": "application/vnd.github+json"}
-    body = { "files": { FILE_NAME: { "content": json.dumps(payload, indent=2) } } }
+    body = {"files": {FILE_NAME: {"content": json.dumps(payload, indent=2)}}}
     requests.patch(f"https://api.github.com/gists/{GIST_ID}",
                    headers=headers, json=body, timeout=10).raise_for_status()
 
-# ────────────────────────── MAIN ────────────────────────────────
+# ---------- main ----------
 def main() -> None:
-    payload = reshape(fetch_indicators())
+    df = enrich_indicators(taapi_candles(SNAP_LEN))
+    last = df.iloc[-1]
+
+    funding_rate, open_interest = funding_and_oi()
+
+    payload = {
+        "timestamp":    int(last.ts),
+        "datetime_utc": iso(int(last.ts)),
+        "symbol":       SYMBOL.replace("/", ""),
+        "granularity":  INTERVAL,
+        "price":        float(last.close),
+        "high":         float(last.high),
+        "low":          float(last.low),
+        "vol":          float(last.vol),
+        "ema20":        float(last.ema20),
+        "ema50":        float(last.ema50),
+        "ema200":       float(last.ema200),
+        "rsi14":        float(last.rsi14),
+        "vwap":         float(last.vwap),
+        "atr14":        float(last.atr14),
+        "last_300_candles": (
+            df[["ts","open","close","high","low","vol"]].tail(SNAP_LEN)
+              .to_dict("records")
+        ),
+        "funding_rate":  funding_rate,
+        "open_interest": open_interest,
+        "order_book":    None,
+        "generated_at":  iso(int(time.time()*1000))
+    }
+
     push_gist(payload)
     print("✅ SOLayer TAAPI-feed geüpload:", payload["generated_at"])
 
