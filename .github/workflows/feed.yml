@@ -1,57 +1,35 @@
-name: KuCoin SOLayer Super Feed
+name: Binance SOLayer TAAPI feed
 
 on:
-  # Update elke 15 min, start op minuut 01 zodat candles gesloten zijn
   schedule:
-    - cron: '1/15 * * * *'
+    - cron: "*/15 * * * *"              # elke 15 min UTC
   workflow_dispatch:
 
 concurrency:
-  group: kucoin-solayer-super-feed
+  group: solayer-taapi-feed
   cancel-in-progress: true
 
 jobs:
   push-feed:
     runs-on: ubuntu-latest
-
     steps:
-    # 1 – Repo klonen
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    # 2 – Python 3.11 klaarzetten
-    - uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
 
-    # 3 – pip‑cache (sneller)
-    - name: Cache pip downloads
-      uses: actions/cache@v4
-      with:
-        path: ~/.cache/pip
-        key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-        restore-keys: |
-          ${{ runner.os }}-pip-
+      # requests is in the std-lib image, maar pin voor de zekerheid
+      - name: Install dependency
+        run: pip install --no-cache-dir requests
 
-    # 4 – Dependencies installeren
-    - name: Install Python dependencies
-      run: |
-        python -m pip install --upgrade pip
-        if [ -s requirements.txt ]; then
-          pip install --no-cache-dir -r requirements.txt
-        else
-          pip install --no-cache-dir pandas pandas_ta ta requests numpy
-        fi
+      - name: Update SOLayer TAAPI feed
+        env:
+          TAAPI_SECRET: ${{ secrets.TAAPI_SECRET }}   # ← nieuw
+          GIST_TOKEN:   ${{ secrets.GIST_TOKEN }}
+          GIST_ID:      ${{ secrets.GIST_ID }}
 
-    # 5 – Feed genereren & Gist bijwerken
-    - name: Build & push SOLayer super‑feed
-      env:
-        # 🔐 Verplichte secrets
-        GIST_TOKEN:  ${{ secrets.GIST_TOKEN }}
-        GIST_ID:     ${{ secrets.GIST_ID }}
-
-        # 📊 Feed‑parameters
-        ENDPOINT:    futures            # 'spot' of 'futures'
-        SYMBOL:      SOLAYERUSDTM
-        TIMEFRAMES:  "1m,5m,15,60,240,D"  # Wordt door het script geparsed
-        FILE_NAME:   solayer_superfeed.json
-      run: python kucoin_solayer_feed.py
+          # optionele overrides
+          SYMBOL:       LAYER/USDT
+          GRANULARITY:  15m
+          FILE_NAME:    solayer_feed.json
+        run: python solayer_taapi_feed.py
