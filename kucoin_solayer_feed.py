@@ -38,31 +38,46 @@ iso = lambda ms: dt.datetime.utcfromtimestamp(ms / 1000).isoformat(timespec="sec
 # ─────────────────────── TAAPI / OHLCV ───────────────────────────
 
 def taapi_candles(backtrack: int = SNAP_LEN) -> pd.DataFrame:
+    """Haalt `backtrack` candles op via TAAPI `/candles`.
+    Vangt de 3 mogelijke reply‑vormen af:
+    1. **list[dict]**  ← sucsesvol
+    2. **{"data": [...]}**  ← white‑label licenties
+    3. **{"status":"error", ...}**  ← foutmeldingen
+    """
     params = {
         "secret": SECRET,
         "exchange": "binance",
         "symbol": SYMBOL,
         "interval": INTERVAL,
-        "backtrack": backtrack,  # max 1500 zonder premium
+        "backtrack": backtrack,
         "format": "JSON",
     }
     r = requests.get(TAAPI_CANDLES, params=params, timeout=15)
     if r.status_code == 401:
         sys.exit("❌ TAAPI 401 Unauthorized – controleer API‑key/plan.")
-    r.raise_for_status()
 
-    data = r.json()
-    # TAAPI geeft list[dict]
+    # TAAPI returnt altijd 200, zelfs bij error‑payloads → check body
+    data: Any = r.json()
+
+    # Case 3 – expliciete error
+    if isinstance(data, dict) and data.get("status") == "error":
+        msg = data.get("message", "onbekende fout")
+        code = data.get("code", "–")
+        sys.exit(f"❌ TAAPI error ({code}): {msg}")
+
+    # Case 2 – wrapper‑dict met data‑key
+    if isinstance(data, dict) and "data" in data:
+        data = data["data"]
+
+    # Nu moet `data` een list zijn
     if not isinstance(data, list) or len(data) < 20:
-        sys.exit("❌ Onverwachte of te korte TAAPI‑payload.")
-
-    df = pd.DataFrame(data).rename(columns={
-        "timestamp": "ts",
-        "volume": "vol",
-    })[["ts", "open", "close", "high", "low", "vol"]]
+        sys.exit(f"❌ Onverwachte of te korte TAAPI‑payload (len={len(data) if isinstance(data, list) else 'N/A'})")
 
     df = (
-        df.astype(float, errors="ignore")
+        pd.DataFrame(data)
+          .rename(columns={"timestamp": "ts", "volume": "vol"})
+          [["ts", "open", "close", "high", "low", "vol"]]
+          .astype(float, errors="ignore")
           .drop_duplicates("ts")
           .sort_values("ts")
           .reset_index(drop=True)
