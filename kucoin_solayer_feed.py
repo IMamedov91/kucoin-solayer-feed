@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-kucoin_solayer_feed.py — v10  ⚡️
+kucoin_solayer_feed.py — v11  🚀
 
-* Snapshot length bumped from **300 → 3000** candles.
-* Added extra buffer so we download 3050 bars to guarantee full indicators.
-* JSON field renamed to **`last_3000_candles`** for clarity.
-* All helper comments & constants updated.
+* Eén *super‑feed* die in één JSON alle relevante data voor meerdere timeframes opslaat.
+* Indicator‑set uitgebreid (MACD, Bollinger, Supertrend, ADX, MFI, OBV).
+* Funding‑rate, open‑interest, order‑book‑imbalance, BTC‑correlatie toegevoegd.
+* Ondersteunt zowel spot als futures via één script.
 """
 
 from __future__ import annotations
@@ -19,42 +19,84 @@ import time
 import typing as t
 from contextlib import suppress
 
+import numpy as np
 import pandas as pd
 import requests
-import ta
+import ta  # voor EMA/RSI/ATR e.d.
+
+try:
+    import pandas_ta as pta  # uitgebreidere set (MACD, Supertrend, …)
+except ImportError:  # fallback – sommige indicaties slaan we dan over
+    pta = None
 
 # ───────────────────────── CONFIG ────────────────────────────────
-ENDPOINT       = os.getenv("ENDPOINT", "spot")              # spot | futures
-TF_DEFAULT     = "15min" if ENDPOINT == "spot" else "15"    # KuCoin style
+ENDPOINT = os.getenv("ENDPOINT", "futures")  # spot | futures
 SYMBOL_DEFAULT = (
-    "SOLAYER-USDT"  if ENDPOINT == "spot"   else  # KuCoin spot
-    "SOLAYERUSDTM" if ENDPOINT == "futures" else None
+    "SOLAYER-USDT" if ENDPOINT == "spot" else "SOLAYERUSDTM"
 )
+BTC_SYMBOL = "BTCUSDTM" if ENDPOINT == "futures" else "BTC-USDT"
 
-if ENDPOINT == "futures":  # KuCoin futures (max 5000 candles per request)
+# KuCoin endpoints
+if ENDPOINT == "futures":
     API_URL, MAX_LIMIT = (
-        "https://api-futures.kucoin.com/api/v1/kline/query", 5000)
-else:                       # KuCoin spot (max 1500 candles per request)
+        "https://api-futures.kucoin.com/api/v1/kline/query", 5000,
+    )
+    FUNDING_URL = "https://api-futures.kucoin.com/api/v1/funding-rate"
+    OPEN_INTEREST_URL = "https://api-futures.kucoin.com/api/v1/openInterest"
+    ORDERBOOK_URL = (
+        "https://api-futures.kucoin.com/api/v1/level2/partOrderBook"
+    )  # depth=N
+else:
     API_URL, MAX_LIMIT = (
-        "https://api.kucoin.com/api/v1/market/candles", 1500)
+        "https://api.kucoin.com/api/v1/market/candles", 1500,
+    )
+    FUNDING_URL = OPEN_INTEREST_URL = ORDERBOOK_URL = None  # spot kent dit niet
 
-# Snapshot of **3000** candles plus a 50-bar warmup buffer for indicators
-SNAPSHOT_LEN = 3000
-FETCH_LEN    = SNAPSHOT_LEN + 50  # download at least 3050 bars
-MS_PER_BAR   = 15 * 60_000
+# Timeframes & lookbacks (bars) – override met ENV `TIMEFRAMES`
+_DEFAULT_TF = [
+    ("1m", 1440),  # 24 h
+    ("5m", 2880),  # 10 d
+    ("15m", 3000),  # 31 d
+    ("60", 3000),  # 125 d (1 h)
+    ("240", 2000),  # 333 d (4 h)
+    ("D", 1000),  # 3 j (1 d)
+]
+
+TIMEFRAMES: list[tuple[str, int]] = []
+_env_tf = os.getenv("TIMEFRAMES")
+if _env_tf:
+    for tf_part in _env_tf.split(","):
+        tf, _, lb = tf_part.partition(":")
+        TIMEFRAMES.append((tf.strip(), int(lb) if lb else 3000))
+else:
+    TIMEFRAMES.extend(_DEFAULT_TF)
+
+# warm‑up om indicatoren te initialiseren
+WARMUP = 250  # bars extra naast lookback
+
 FILE_DEFAULT = "solayer_feed.json"
+MS_PER_BAR_MAP = {
+    "1m": 60_000,
+    "5m": 5 * 60_000,
+    "15m": 15 * 60_000,
+    "60": 60 * 60_000,
+    "240": 240 * 60_000,
+    "D": 24 * 60 * 60_000,
+}
 
 pd.options.mode.copy_on_write = True
 
 # ─────────────────────── HELPER FUNCTIONS ───────────────────────
 
 def _iso(ms: int | float) -> str:
-    """Epoch-ms → ISO-8601 (UTC)."""
-    return dt.datetime.utcfromtimestamp(ms / 1000).isoformat(timespec="seconds") + "Z"
+    return (
+        dt.datetime.utcfromtimestamp(ms / 1000)
+        .isoformat(timespec="seconds")
+        + "Z"
+    )
 
 
 def _clean(val: t.Any) -> t.Any:
-    """Map NaN/inf (incl. numpy & pandas) to None so JSON dumps cleanly."""
     if val is None:
         return None
     with suppress(TypeError):
@@ -63,45 +105,68 @@ def _clean(val: t.Any) -> t.Any:
     return val
 
 
+def _sleep_backoff(base: float = 1.0):
+    time.sleep(base)
+    return base * 2
+
+
 # ───────────────────── KuCoin API INTEGRATION ────────────────────
 
-def _get(params: dict, retries: int = 3) -> list[list[t.Any]]:
-    """Thin wrapper around requests.get with naive retry/back-off."""
+def _get(url: str, params: dict, retries: int = 3) -> dict:
     err: Exception | None = None
     backoff = 1.0
     for _ in range(retries):
         try:
-            r = requests.get(API_URL, params=params, timeout=10)
+            r = requests.get(url, params=params, timeout=10)
             if r.status_code == 429:
-                raise RuntimeError("Rate-limited by KuCoin (429)")
+                raise RuntimeError("Rate‑limited by KuCoin (429)")
             r.raise_for_status()
-            return r.json()["data"]
+            return r.json()
         except Exception as e:
             err = e
-            time.sleep(backoff)
-            backoff *= 2
-    raise RuntimeError(f"KuCoin API keeps failing after retries: {err}") from err
+            backoff = _sleep_backoff(backoff)
+    raise RuntimeError(f"KuCoin API keeps failing: {err}") from err
 
 
-def fetch_frame(symbol: str, tf: str | int) -> pd.DataFrame:
-    """Download raw candles & compute indicators (no NaN/inf)."""
+def _tf_to_kucoin(tf: str) -> str | int:
+    """Return granularity param expected by KuCoin."""
+    if ENDPOINT == "spot":
+        return tf  # e.g. "1m" | "15min" ; KuCoin spot accepts both
+    return int(tf) if tf.isdigit() else (
+        1440 if tf.upper() == "D" else 1  # fallback
+    )
+
+
+def fetch_frame(symbol: str, tf: str, lookback: int) -> pd.DataFrame:
     raw: list[list[t.Any]] = []
     end_ms = int(time.time() * 1000)
+    need = lookback + WARMUP
 
-    while len(raw) < FETCH_LEN:
+    while len(raw) < need:
         params = (
-            {"symbol": symbol, "type": tf, "limit": MAX_LIMIT, "endAt": end_ms}
-            if ENDPOINT == "spot" else
-            {"symbol": symbol, "granularity": int(tf), "limit": MAX_LIMIT, "to": end_ms}
+            {
+                "symbol": symbol,
+                "type": tf,
+                "limit": min(MAX_LIMIT, need - len(raw)),
+                "endAt": end_ms,
+            }
+            if ENDPOINT == "spot"
+            else {
+                "symbol": symbol,
+                "granularity": _tf_to_kucoin(tf),
+                "limit": min(MAX_LIMIT, need - len(raw)),
+                "to": end_ms,
+            }
         )
-        batch = _get(params)
+        batch = _get(API_URL, params)["data"]
         if not batch:
             break
         raw.extend(batch)
-        end_ms = int(batch[-1][0]) - MS_PER_BAR
+        # KuCoin returns ascending or descending? – treat as list of lists, first element is ts
+        end_ms = int(batch[-1][0]) - MS_PER_BAR_MAP.get(tf, 60_000)
 
-    if len(raw) < FETCH_LEN:
-        print(f"⚠️ Only fetched {len(raw)} bars (< {FETCH_LEN}); indicators may be less accurate.")
+    if len(raw) < need:
+        print(f"⚠️ fetched {len(raw)} < {need} bars for {tf}")
 
     # Build DataFrame
     if ENDPOINT == "spot":
@@ -109,28 +174,117 @@ def fetch_frame(symbol: str, tf: str | int) -> pd.DataFrame:
         df = pd.DataFrame(raw, columns=cols)
     else:
         cols_api = ["ts", "open", "high", "low", "close", "vol"]
-        df = pd.DataFrame(raw, columns=cols_api)[["ts", "open", "close", "high", "low", "vol"]]
+        df = (
+            pd.DataFrame(raw, columns=cols_api)[
+                ["ts", "open", "close", "high", "low", "vol"]
+            ]
+        )
 
     df = (
         df.astype(float, errors="ignore")
-          .drop_duplicates("ts")
-          .sort_values("ts")
-          .reset_index(drop=True)
+        .drop_duplicates("ts")
+        .sort_values("ts")
+        .reset_index(drop=True)
     )
 
-    # ───── indicators via ta
-    df["ema20"]  = ta.trend.ema_indicator(df["close"], 20)
-    df["ema50"]  = ta.trend.ema_indicator(df["close"], 50)
-    df["ema200"] = ta.trend.ema_indicator(df["close"], 200)
-    df["rsi14"]  = ta.momentum.rsi(df["close"], 14)
-    df["vwap"]   = ta.volume.volume_weighted_average_price(df["high"], df["low"], df["close"], df["vol"], 14)
-    df["atr14"]  = ta.volatility.average_true_range(df["high"], df["low"], df["close"], 14)
-    df["vol_mean20"] = df["vol"].rolling(20, min_periods=1).mean()
+    return df.tail(lookback).reset_index(drop=True)
 
-    ind_cols = ["ema20", "ema50", "ema200", "rsi14", "vwap", "atr14", "vol_mean20"]
-    df[ind_cols] = df[ind_cols].ffill().bfill()
 
-    return df.tail(SNAPSHOT_LEN).reset_index(drop=True)
+# ───────────────────── INDICATORS ───────────────────────────────
+
+def calc_indicators(df: pd.DataFrame) -> dict[str, t.Any]:
+    """Return dict with all indicators for *last* row."""
+    ind: dict[str, t.Any] = {}
+
+    # Ensure numeric cols
+    close, high, low, vol = df["close"], df["high"], df["low"], df["vol"]
+
+    # ta
+    ind["ema20"] = ta.trend.ema_indicator(close, 20).iloc[-1]
+    ind["ema50"] = ta.trend.ema_indicator(close, 50).iloc[-1]
+    ind["ema200"] = ta.trend.ema_indicator(close, 200).iloc[-1]
+    ind["rsi14"] = ta.momentum.rsi(close, 14).iloc[-1]
+    ind["atr14"] = ta.volatility.average_true_range(high, low, close, 14).iloc[-1]
+    ind["vwap"] = ta.volume.volume_weighted_average_price(high, low, close, vol, 14).iloc[-1]
+    ind["vol_mean20"] = vol.rolling(20, min_periods=1).mean().iloc[-1]
+
+    if pta is not None:
+        macd = pta.macd(close, fast=12, slow=26, signal=9)
+        bb = pta.bbands(close, length=20, std=2)
+        adx = pta.adx(high, low, close, length=14)
+        mfi = pta.mfi(high, low, close, vol, length=14)
+        sup = pta.supertrend(high, low, close, length=10, multiplier=3)
+        obv = pta.obv(close, vol)
+
+        ind["macd"] = {
+            "macd": macd["MACD_12_26_9"].iloc[-1],
+            "signal": macd["MACDs_12_26_9"].iloc[-1],
+            "hist": macd["MACDh_12_26_9"].iloc[-1],
+        }
+        ind["bbands"] = {
+            "upper": bb["BBU_20_2.0"].iloc[-1],
+            "lower": bb["BBL_20_2.0"].iloc[-1],
+            "basis": bb["BBM_20_2.0"].iloc[-1],
+        }
+        ind["adx"] = adx["ADX_14"].iloc[-1]
+        ind["mfi"] = mfi.iloc[-1]
+        ind["supertrend"] = sup["SUPERT_10_3.0"].iloc[-1]
+        ind["obv"] = obv.iloc[-1]
+
+    # Clean NaN/inf
+    return {k: _clean(v) for k, v in ind.items()}
+
+
+# ───────────────────── EXTERNAL DATA (futures) ──────────────────
+
+def get_funding(symbol: str) -> dict[str, t.Any]:
+    if not FUNDING_URL:
+        return {"current": None, "predicted": None, "history_7d": []}
+    res_now = _get(FUNDING_URL, {"symbol": symbol})["data"]
+    now_val = float(res_now.get("fundingRate", 0))
+
+    res_hist = _get(
+        FUNDING_URL + "/history",
+        {"symbol": symbol, "reverse": "true", "pageSize": 56},  # 56×8h ≈ 7 d
+    )["data"]
+    hist = [float(row["fundingRate"]) for row in res_hist]
+    pred = hist[0] if hist else None
+    return {"current": now_val, "predicted": pred, "history_7d": hist[:21]}
+
+
+def get_open_interest(symbol: str) -> dict[str, t.Any]:
+    if not OPEN_INTEREST_URL:
+        return {"value": None, "change_24h_pct": None}
+    res = _get(OPEN_INTEREST_URL, {"symbol": symbol})["data"]
+    oi_val = float(res.get("openInterest", 0))
+    oi_24h = float(res.get("openInterestValue24h", 0))
+    pct = ((oi_val - oi_24h) / oi_24h * 100) if oi_24h else None
+    return {"value": oi_val, "change_24h_pct": pct}
+
+
+def get_order_book_depth(symbol: str, depth: int = 5) -> dict[str, t.Any]:
+    if not ORDERBOOK_URL:
+        return {}
+    res = _get(ORDERBOOK_URL, {"symbol": symbol, "depth": depth})["data"]
+    bids = sum(float(b[1]) for b in res.get("bids", []))
+    asks = sum(float(a[1]) for a in res.get("asks", []))
+    imb = (bids - asks) / (bids + asks) * 100 if bids + asks else None
+    return {
+        "bids_qty": bids,
+        "asks_qty": asks,
+        "imbalance_pct": imb,
+        "last_updated": int(time.time() * 1000),
+    }
+
+
+def btc_correlation(df_alt: pd.DataFrame) -> float | None:
+    """30 d Pearson corr op 1 h basis."""
+    try:
+        df_btc = fetch_frame(BTC_SYMBOL, "60", 720)  # 30 d * 24 h = 720 bars
+        corr = np.corrcoef(df_alt["close"].tail(720), df_btc["close"].tail(720))[0, 1]
+        return float(corr)
+    except Exception:
+        return None
 
 
 # ────────────────────── PUSH TO GIST ─────────────────────────────
@@ -139,7 +293,10 @@ def push_gist(token: str, gist_id: str, fname: str, payload: dict) -> None:
     json_content = json.dumps(payload, indent=2, allow_nan=False, ensure_ascii=False)
     r = requests.patch(
         f"https://api.github.com/gists/{gist_id}",
-        headers={"Authorization": f"token {token}", "Accept": "application/vnd.github+json"},
+        headers={
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github+json",
+        },
         json={"files": {fname: {"content": json_content}}},
         timeout=10,
     )
@@ -150,42 +307,39 @@ def push_gist(token: str, gist_id: str, fname: str, payload: dict) -> None:
 
 def main() -> None:
     gist_id = os.environ["GIST_ID"]
-    token   = os.environ["GIST_TOKEN"]
-    symbol  = os.getenv("SYMBOL", SYMBOL_DEFAULT)
-    tf      = os.getenv("GRANULARITY", TF_DEFAULT)
-    fname   = os.getenv("FILE_NAME", FILE_DEFAULT)
+    token = os.environ["GIST_TOKEN"]
+    symbol = os.getenv("SYMBOL", SYMBOL_DEFAULT)
+    fname = os.getenv("FILE_NAME", FILE_DEFAULT)
 
-    df   = fetch_frame(symbol, tf)
-    last = df.iloc[-1]
-
-    payload = {
-        "timestamp":    int(last.ts),
-        "datetime_utc": _iso(int(last.ts)),
-        "symbol":       symbol,
-        "granularity":  str(tf),
-        "price":        _clean(last.close),
-        "high":         _clean(last.high),
-        "low":          _clean(last.low),
-        "vol":          _clean(last.vol),
-        "ema20":        _clean(last.ema20),
-        "ema50":        _clean(last.ema50),
-        "ema200":       _clean(last.ema200) or "insufficient_data",
-        "rsi14":        _clean(last.rsi14),
-        "vwap":         _clean(last.vwap),
-        "atr14":        _clean(last.atr14),
-        "vol_mean20":   _clean(last.vol_mean20),
-        "last_3000_candles": [
-            {k: _clean(v) if k != "ts" else int(v) for k, v in rec.items()}
-            for rec in df[["ts", "open", "close", "high", "low", "vol"]].to_dict("records")
-        ],
-        "funding_rate":  None,
-        "open_interest": None,
-        "order_book":    None,
-        "generated_at":  _iso(int(time.time() * 1000)),
+    payload: dict[str, t.Any] = {
+        "generated_at": _iso(int(time.time() * 1000)),
+        "symbol": symbol,
+        "candles": {},
+        "indicators": {},
     }
 
+    for tf, lookback in TIMEFRAMES:
+        df = fetch_frame(symbol, tf, lookback)
+        payload["candles"][tf] = {
+            "lookback": lookback,
+            "bars": [
+                {k: _clean(v) if k != "ts" else int(v) for k, v in rec.items()}
+                for rec in df[["ts", "open", "close", "high", "low", "vol"]].to_dict("records")
+            ],
+        }
+        payload["indicators"][tf] = calc_indicators(df)
+
+        # corr alleen eenmaal bij langste tf gebruiken → 1h referentie
+        if tf == "60":
+            payload["btc_correlation_30d"] = _clean(btc_correlation(df))
+
+    # Extra futures data
+    payload["funding"] = get_funding(symbol)
+    payload["open_interest"] = get_open_interest(symbol)
+    payload["order_book"] = get_order_book_depth(symbol, depth=5)
+
     push_gist(token, gist_id, fname, payload)
-    print("✅ SOLayer feed (3000 candles) uploaded:", payload["generated_at"])
+    print("✅ SOLayer multi‑TF feed uploaded:", payload["generated_at"])
 
 
 if __name__ == "__main__":
