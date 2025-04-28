@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-solayer_feed_taapi.py — v1.6  🟢 **FULL SOURCE (≈240 regels)**
+kucoin_solayer_feed.py — v1.6  🟢 **FULL SOURCE (≈240 regels)**
 
 • Haalt max 300 × 15‑min candles voor LAYER/USDT (Binance‑spot) via TAAPI `/candles` in 99‑bar chunks.
 • Indicatoren: EMA20/50/200, RSI14, ATR14, VWAP, vol_mean20 — lokaal berekend (ta‑lib).
