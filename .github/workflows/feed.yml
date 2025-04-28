@@ -32,4 +32,4 @@ jobs:
           SYMBOL:       LAYER/USDT
           GRANULARITY:  15m
           FILE_NAME:    solayer_feed.json
-        run: python solayer_taapi_feed.py
+        run: python kucoin_solayer_feed.py
