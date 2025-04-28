@@ -1,141 +1,188 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-kucoin_solayer_feed.py — v1.3.1  🔧 Bug‑fix
+solayer_feed_taapi.py — v1.4  ⚡️ Full‑stack feed
 
-* Fix: TAAPI `/candles` returns **a list**, niet `{"data": [... ]}`.
-  Daardoor kreeg je `TypeError: list indices must be integers or slices, not str`.
-* Functie `taapi_candles()` nu robuust voor beide varianten (list / dict).
-* Kleine guard → assert op minimale candle‑aantal.
+* 300 × 15‑min OHLCV‑candles via TAAPI `/candles` (cheap 1 call).
+* Indicators **lokaal** berekend (EMA20/50/200, RSI14, ATR14, VWAP, vol_mean20) → nooit NaN.
+* Binance‑futures **funding rate** & **open interest** opgehaald; order‑book imbalance depth‑5 toegevoegd.
+* Schema sluit exact aan op eerdere afspraken; granularity = "15m".
 """
 
 from __future__ import annotations
-import datetime as dt, json, os, sys, time
+
+import datetime as dt
+import json
+import os
+import sys
+import time
 from typing import Any, Dict, List
 
 import pandas as pd
 import requests
 import ta
 
-# ─────────────────────────── CONFIG ─────────────────────────────
-SECRET      = os.getenv("TAAPI_SECRET") or sys.exit("❌ TAAPI_SECRET ontbreekt")
-GIST_ID     = os.getenv("GIST_ID")      or sys.exit("❌ GIST_ID ontbreekt")
-GIST_TOKEN  = os.getenv("GIST_TOKEN")   or sys.exit("❌ GIST_TOKEN ontbreekt")
+# ──────────────────────────── CONFIG ─────────────────────────────
+SECRET       = os.getenv("TAAPI_SECRET") or sys.exit("❌ TAAPI_SECRET ontbreekt")
+GIST_ID      = os.getenv("GIST_ID")      or sys.exit("❌ GIST_ID ontbreekt")
+GIST_TOKEN   = os.getenv("GIST_TOKEN")   or sys.exit("❌ GIST_TOKEN ontbreekt")
 
-SYMBOL      = os.getenv("SYMBOL", "LAYER/USDT")   # TAAPI‑formaat
-INTERVAL    = os.getenv("GRANULARITY", "15m")     # '15m', '1h', …
-SNAP_LEN    = int(os.getenv("SNAP_LEN", 300))      # aantal bars dat we in payload willen
-FILE_NAME   = os.getenv("FILE_NAME", "solayer_feed.json")
-
+SYMBOL       = os.getenv("SYMBOL", "LAYER/USDT")  # TAAPI‑formaat
+INTERVAL     = os.getenv("GRANULARITY", "15m")     # '15m', '1h', …
+SNAP_LEN     = int(os.getenv("SNAP_LEN", 300))      # candles in snapshot
+FILE_NAME    = os.getenv("FILE_NAME", "solayer_feed.json")
 TAAPI_CANDLES = "https://api.taapi.io/candles"
 
-iso = lambda ms: dt.datetime.utcfromtimestamp(ms/1000).isoformat(timespec="seconds") + "Z"
+iso = lambda ms: dt.datetime.utcfromtimestamp(ms / 1000).isoformat(timespec="seconds") + "Z"
 
-# ─────────────────────── TAAPI candles ─────────────────────────
+# ─────────────────────── TAAPI / OHLCV ───────────────────────────
 
-def taapi_candles(length: int = 300) -> pd.DataFrame:
-    """Download `length` OHLCV‑bars via TAAPI `/candles`."""
+def taapi_candles(backtrack: int = SNAP_LEN) -> pd.DataFrame:
     params = {
-        "secret":   SECRET,
+        "secret": SECRET,
         "exchange": "binance",
-        "symbol":   SYMBOL.replace("/", ""),
+        "symbol": SYMBOL,
         "interval": INTERVAL,
-        "backtrack": length - 1,  # TAAPI telt de huidige candle als 0
+        "backtrack": backtrack,  # max 1500 zonder premium
+        "format": "JSON",
     }
-    r = requests.get(TAAPI_CANDLES, params=params, timeout=10)
+    r = requests.get(TAAPI_CANDLES, params=params, timeout=15)
     if r.status_code == 401:
-        sys.exit("❌ TAAPI 401 Unauthorized – check API‑key / plan.")
+        sys.exit("❌ TAAPI 401 Unauthorized – controleer API‑key/plan.")
     r.raise_for_status()
 
-    raw = r.json()
-    # TAAPI kan list ⟂ dict teruggeven; normaliseer
-    if isinstance(raw, dict):
-        raw = raw.get("data", [])
-    if not isinstance(raw, list):
-        sys.exit(f"❌ Onbekend TAAPI‑response‑type: {type(raw)}")
+    data = r.json()
+    # TAAPI geeft list[dict]
+    if not isinstance(data, list) or len(data) < 20:
+        sys.exit("❌ Onverwachte of te korte TAAPI‑payload.")
 
-    if len(raw) < length:
-        print(f"⚠️ Ontving slechts {len(raw)} candles, minder dan {length}–gevraagd.")
+    df = pd.DataFrame(data).rename(columns={
+        "timestamp": "ts",
+        "volume": "vol",
+    })[["ts", "open", "close", "high", "low", "vol"]]
 
-    df = pd.DataFrame(raw)[["timestamp", "open", "close", "high", "low", "volume"]]
-    df = df.rename(columns={"timestamp": "ts", "volume": "vol"}).astype(float)
-    df["ts"] = df["ts"].astype(int)
-    df = df.sort_values("ts").reset_index(drop=True)
-    return df.tail(length)
+    df = (
+        df.astype(float, errors="ignore")
+          .drop_duplicates("ts")
+          .sort_values("ts")
+          .reset_index(drop=True)
+    )
+    return df.tail(SNAP_LEN)
 
-# ───────────────────── Indicators lokaal ───────────────────────
+# ───────────────────── Indicator‑berekening ‑ lokaal ─────────────
 
 def enrich_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
+    df.set_index("ts", inplace=True)
+
     df["ema20"]  = ta.trend.ema_indicator(df["close"], 20)
     df["ema50"]  = ta.trend.ema_indicator(df["close"], 50)
     df["ema200"] = ta.trend.ema_indicator(df["close"], 200)
     df["rsi14"]  = ta.momentum.rsi(df["close"], 14)
     df["atr14"]  = ta.volatility.average_true_range(df["high"], df["low"], df["close"], 14)
-    df["vwap"]   = (df["vol"] * df["close"]).cumsum() / df["vol"].cumsum()
-    return df
 
-# ───────────────── Macro‑data (funding / OI) ───────────────────
+    df["vwap"] = (
+        (df["close"] * df["vol"]).cumsum() / df["vol"].cumsum()
+    )
+    df["vol_mean20"] = df["vol"].rolling(20, min_periods=20).mean()
 
-def binance_future_metrics() -> Dict[str, float | None]:
-    symbol = SYMBOL.replace("/", "").upper() + "T"  # LAYERUSDT
-    out: Dict[str, float | None] = {"funding_rate": None, "open_interest": None}
+    # NaN‑opvulling (forward‑fill na warm‑up, back‑fill voor eerste waarden)
+    df.ffill(inplace=True)
+    df.bfill(inplace=True)
+
+    return df.reset_index()
+
+# ───────────────────── Macro‑data (funding / OI / book) ──────────
+
+def fetch_macro(bin_sym: str) -> Dict[str, Any]:
+    out: Dict[str, Any] = {"funding_rate": None, "open_interest": None, "order_book": None}
     try:
-        fr = requests.get("https://fapi.binance.com/fapi/v1/fundingRate",
-                           params={"symbol": symbol, "limit": 1}, timeout=8).json()[0]
+        # funding rate laatste settlement
+        fr = requests.get(
+            "https://fapi.binance.com/fapi/v1/fundingRate",
+            params={"symbol": bin_sym, "limit": 1}, timeout=10
+        ).json()[0]
         out["funding_rate"] = float(fr["fundingRate"])
-    except Exception:
-        pass
-    try:
-        oi = requests.get("https://fapi.binance.com/futures/data/openInterestHist",
-                           params={"symbol": symbol, "period": "5m", "limit": 1}, timeout=8).json()[0]
+
+        # open interest (hist endpoint kan leeg zijn voor alt‑pairs)
+        oi = requests.get(
+            "https://fapi.binance.com/futures/data/openInterestHist",
+            params={"symbol": bin_sym, "period": "5m", "limit": 1}, timeout=10
+        ).json()[0]
         out["open_interest"] = float(oi["sumOpenInterest"])
     except Exception:
+        pass  # laat op None
+
+    try:
+        depth = requests.get(
+            "https://api.binance.com/api/v3/depth",
+            params={"symbol": bin_sym, "limit": 5}, timeout=10
+        ).json()
+        bids_qty = sum(float(b[1]) for b in depth.get("bids", []))
+        asks_qty = sum(float(a[1]) for a in depth.get("asks", []))
+        if bids_qty + asks_qty > 0:
+            imb = (bids_qty - asks_qty) / (bids_qty + asks_qty) * 100
+            out["order_book"] = {
+                "depth5_bids_qty": bids_qty,
+                "depth5_asks_qty": asks_qty,
+                "imbalance_pct": round(imb, 2),
+            }
+    except Exception:
         pass
+
     return out
 
-# ──────────────────────── Gist push ────────────────────────────
+# ────────────────────── PUSH TO GIST ─────────────────────────────
 
 def push_gist(payload: Dict[str, Any]) -> None:
-    headers = {"Authorization": f"token {GIST_TOKEN}",
-               "Accept": "application/vnd.github+json"}
+    headers = {
+        "Authorization": f"token {GIST_TOKEN}",
+        "Accept": "application/vnd.github+json",
+    }
     body = {"files": {FILE_NAME: {"content": json.dumps(payload, indent=2)}}}
-    requests.patch(f"https://api.github.com/gists/{GIST_ID}",
-                   headers=headers, json=body, timeout=10).raise_for_status()
+    requests.patch(
+        f"https://api.github.com/gists/{GIST_ID}", headers=headers, json=body, timeout=15
+    ).raise_for_status()
 
-# ────────────────────────── MAIN ────────────────────────────────
+# ─────────────────────────── MAIN ────────────────────────────────
 
 def main() -> None:
-    df = enrich_indicators(taapi_candles(SNAP_LEN))
-    assert not df.empty, "Geen candles ontvangen."
+    # 1 – raw candles
+    candles = taapi_candles(SNAP_LEN)
 
+    # 2 – indicators lokaal
+    df = enrich_indicators(candles.copy())
     last = df.iloc[-1]
-    meta  = binance_future_metrics()
 
+    # 3 – macro‑data
+    binance_symbol = SYMBOL.replace("/", "").upper()  # LAYERUSDT
+    macro = fetch_macro(binance_symbol)
+
+    # 4 – payload
     payload: Dict[str, Any] = {
-        "timestamp":    int(last.ts),
+        "timestamp": int(last.ts),
         "datetime_utc": iso(int(last.ts)),
-        "symbol":       SYMBOL.replace("/", ""),
-        "granularity":  INTERVAL,
-        "price":        float(last.close),
-        "high":         float(last.high),
-        "low":          float(last.low),
-        "vol":          float(last.vol),
-        "ema20":        float(last.ema20),
-        "ema50":        float(last.ema50),
-        "ema200":       float(last.ema200),
-        "rsi14":        float(last.rsi14),
-        "vwap":         float(last.vwap),
-        "atr14":        float(last.atr14),
+        "symbol": SYMBOL.replace("/", ""),
+        "granularity": INTERVAL,
+        "price": float(round(last.close, 6)),
+        "high": float(round(last.high, 6)),
+        "low": float(round(last.low, 6)),
+        "vol": float(round(last.vol, 2)),
+        "ema20": float(round(last.ema20, 6)),
+        "ema50": float(round(last.ema50, 6)),
+        "ema200": float(round(last.ema200, 6)),
+        "rsi14": float(round(last.rsi14, 2)),
+        "vwap": float(round(last.vwap, 6)),
+        "atr14": float(round(last.atr14, 6)),
+        "vol_mean20": float(round(last.vol_mean20, 2)),
         "last_300_candles": df.tail(SNAP_LEN).to_dict("records"),
-        "funding_rate":  meta["funding_rate"],
-        "open_interest": meta["open_interest"],
-        "order_book":    None,
-        "generated_at":  iso(int(time.time()*1000)),
+        **macro,
+        "generated_at": iso(int(time.time() * 1000)),
     }
 
+    # 5 – push naar Gist
     push_gist(payload)
-    print("✅ SOLayer TAAPI‑feed geüpload:", payload["generated_at"])
+    print("✅ SOLayer TAAPI‑feed v1.4 geüpload:", payload["generated_at"])
+
 
 if __name__ == "__main__":
     main()
