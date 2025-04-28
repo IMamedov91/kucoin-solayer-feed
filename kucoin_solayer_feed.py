@@ -44,12 +44,14 @@ def taapi_candles(backtrack: int = SNAP_LEN) -> pd.DataFrame:
     2. **{"data": [...]}**  ← white‑label licenties
     3. **{"status":"error", ...}**  ← foutmeldingen
     """
-    params = {
+        params = {
         "secret": SECRET,
         "exchange": "binance",
         "symbol": SYMBOL,
         "interval": INTERVAL,
-        "backtrack": backtrack,
+        # TAAPI: "backtracks" = aantal candles ⟶ vraag er precies SNAP_LEN op
+        "backtracks": backtrack,
+        "backtrack": 0,        # start bij meest recente candle
         "format": "JSON",
     }
     r = requests.get(TAAPI_CANDLES, params=params, timeout=15)
