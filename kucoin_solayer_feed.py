@@ -53,42 +53,54 @@ def _clean(val: Any) -> Any:
 # ───────────────────── TAAPI CANDLES FETCH ─────────────────────
 
 def taapi_candles(backtracks: int = SNAP_LEN) -> pd.DataFrame:
-    """Return a DataFrame with OHLCV for the requested number of candles."""
+    """Fetch up to `backtracks` candles; TAAPI free tier returns max 99 per call.
+    We therefore loop in ≤99‑candle chunks until we have enough data.
+    """
 
-    params = {
-        "secret": SECRET,
-        "exchange": "binance",
-        "symbol": SYMBOL,
-        "interval": INTERVAL,
-        "backtracks": backtracks,
-        "backtrack": 0,
-        "format": "JSON",
-    }
+    CHUNK = 99  # free‑tier ceiling; pro‑tiers allow 500
+    frames: List[pd.DataFrame] = []
+    fetched = 0
 
-    r = requests.get(TAAPI_URL, params=params, timeout=10)
-    if r.status_code == 401:
-        sys.exit("❌ TAAPI 401 Unauthorized – controleer je API‑key en plan.")
+    while fetched < backtracks:
+        want = min(CHUNK, backtracks - fetched)
+        params = {
+            "secret": SECRET,
+            "exchange": "binance",
+            "symbol": SYMBOL,
+            "interval": INTERVAL,
+            "backtracks": want,
+            "backtrack": fetched,   # offset
+            "format": "JSON",
+        }
+        r = requests.get(TAAPI_URL, params=params, timeout=10)
+        if r.status_code == 401:
+            sys.exit("❌ TAAPI 401 Unauthorized – controleer je API‑key/plan.")
 
-    payload = r.json()
+        payload = r.json()
+        if isinstance(payload, dict):
+            if payload.get("status") == "error":
+                sys.exit(f"❌ TAAPI error: {payload.get('message')}")
+            payload = payload.get("data", [])
 
-    # handle different TAAPI reply shapes
-    if isinstance(payload, dict):
-        if payload.get("status") == "error":
-            msg = payload.get("message", "onbekende fout")
-            sys.exit(f"❌ TAAPI error: {msg}")
-        if "data" in payload:
-            payload = payload["data"]
+        if not payload:
+            break  # TAAPI stuurde gewoon niks terug → einde historiek
 
-    if not isinstance(payload, list) or len(payload) < 20:
-        sys.exit(f"❌ Onverwachte of te korte TAAPI‑payload (len={len(payload)})")
+        tmp = pd.DataFrame(payload)[["timestamp", "open", "close", "high", "low", "volume"]]
+        tmp.rename(columns={"timestamp": "ts", "volume": "vol"}, inplace=True)
+        tmp = tmp.astype(float)
+        frames.append(tmp)
+        fetched += len(tmp)
+        time.sleep(0.25)  # soft‑throttle to avoid 429
 
-    df = pd.DataFrame(payload)[["timestamp", "open", "close", "high", "low", "volume"]]
-    df.rename(columns={"timestamp": "ts", "volume": "vol"}, inplace=True)
-    df = df.astype(float)
-    df.sort_values("ts", inplace=True)
+        if len(tmp) < want:
+            break  # minder bars dan gevraagd → historiek op
 
-    # houd alleen de laatste SNAP_LEN rows
-    df = df.tail(SNAP_LEN).reset_index(drop=True)
+    if not frames:
+        sys.exit("❌ TAAPI gaf geen data terug.")
+
+    df = pd.concat(frames).sort_values("ts").tail(backtracks).reset_index(drop=True)
+    if len(df) < 20:
+        sys.exit(f"❌ Te weinig candles ontvangen ({len(df)}) – plan upgrade nodig of verkeerde symbol.")
     return df
 
 # ───────────────────── INDICATOR CALCULATIONS ──────────────────
