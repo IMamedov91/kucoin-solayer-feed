@@ -54,4 +54,4 @@ jobs:
           GRANULARITY:  15m
           SNAP_LEN:     300
           FILE_NAME:    solayer_feed.json
-        run: python solayer_feed_taapi.py
+        run: python kucoin_solayer_feed.py
