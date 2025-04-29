@@ -24,8 +24,14 @@ BASE = "https://api.taapi.io/"
 REQ  = requests.Session()
 
 # indicator-set
-INDICS = [("ema",{"period":50}),("ema",{"period":200}),("rsi",{"period":14}),("macd",{}),("average-true-range",{"period":14}),("price",{})]
-
+INDICS = [
+    ("ema", {"period": 50}),
+    ("ema", {"period": 200}),
+    ("rsi", {"period": 14}),
+    ("macd", {}),
+    ("atr", {"period": 14}),      # ← gefixt
+    ("price", {})
+]
 def taapi_call(endpoint, extra, tf):
     params = {"secret":TAAPI_SEC,"exchange":"binance","symbol":SYMBOL,"interval":tf,**extra}
     r = REQ.get(BASE+endpoint, params=params, timeout=10)
