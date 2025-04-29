@@ -1,89 +1,105 @@
 #!/usr/bin/env python3
-"""
-kucoin_solayer_feed.py
+"""Fetch TAAPI indicators for LAYER/USDT (15 m), decide long/short/flat, and PATCH a GitHub Gist."""
+import os, json, datetime as dt, requests, sys
 
-Fetches EMA 50, EMA 200, RSI 14 and MACD histogram for LAYER/USDT on Binance via
-TAAPI.io’s bulk endpoint, derives a bias (long / short / flat) and updates a
-GitHub Gist with a JSON payload that downstream bots can consume.
+SYMBOL      = os.getenv('SYMBOL', 'LAYER/USDT')
+INTERVAL    = os.getenv('INTERVAL', '15m')
+MACD_EPS    = float(os.getenv('MACD_EPS', '0.0005'))  # neutral zone for MACD hist
+FILE_NAME   = os.getenv('FILE_NAME', 'solayer_feed.json')
+TAAPI_SEC   = os.environ['TAAPI_SECRET']
+GIST_ID     = os.environ['GIST_ID']
+GIST_TOKEN  = os.environ['GIST_TOKEN']
 
-Environment variables
----------------------
-TAAPI_SECRET : TAAPI.io secret token (required)
-GIST_TOKEN   : GitHub token with `gist` or `contents:write` scope (required)
-GIST_ID      : ID of the target Gist (required)
-SYMBOL       : Trading pair, default "LAYER/USDT"
-GRANULARITY  : Timeframe, default "15m"
-FILE_NAME    : File inside the Gist, default "solayer_feed.json"
-"""
+SESSION = requests.Session()
+BASE_URL = 'https://api.taapi.io/'
 
-import os, json, datetime, sys, requests
+INDICATORS = [
+    ('ema', 50),
+    ('ema', 200),
+    ('rsi', 14),
+    ('macd', None),  # TAAPI default (12,26,9)
+]
 
-TAAPI_SECRET = os.getenv("TAAPI_SECRET")
-GIST_TOKEN   = os.getenv("GIST_TOKEN")
-GIST_ID      = os.getenv("GIST_ID")
-SYMBOL       = os.getenv("SYMBOL", "LAYER/USDT")
-INTERVAL     = os.getenv("GRANULARITY", "15m")
-FILE_NAME    = os.getenv("FILE_NAME", "solayer_feed.json")
+def fetch_one(kind: str, period):
+    params = {
+        'secret': TAAPI_SEC,
+        'exchange': 'binance',
+        'symbol': SYMBOL,
+        'interval': INTERVAL,
+        'indicator': kind,
+    }
+    if period is not None:
+        params['period'] = period
+    r = SESSION.get(BASE_URL + 'indicator', params=params, timeout=10)
+    r.raise_for_status()
+    return r.json()['value']
 
-if not all([TAAPI_SECRET, GIST_TOKEN, GIST_ID]):
-    sys.exit("TAAPI_SECRET, GIST_TOKEN and GIST_ID must be set as env vars")
 
-# 1️⃣  Fetch indicators via TAAPI bulk endpoint
-bulk_url = "https://api.taapi.io/bulk"
-construct = {
-    "exchange": "binance",
-    "symbol": SYMBOL,
-    "interval": INTERVAL,
-    "indicators": [
-        {"id": "ema50",  "indicator": "ema",  "period": 50},
-        {"id": "ema200", "indicator": "ema",  "period": 200},
-        {"id": "rsi",    "indicator": "rsi",  "period": 14},
-        {"id": "macd",   "indicator": "macd"}
-    ]
-}
+def fetch_all():
+    out = {}
+    for kind, period in INDICATORS:
+        val = fetch_one(kind, period)
+        key = f"{kind}{period or ''}"
+        out[key] = val if not isinstance(val, dict) else val  # MACD returns dict
+    return out
 
-r = requests.post(bulk_url, json={"secret": TAAPI_SECRET, "construct": construct}, timeout=10)
-r.raise_for_status()
-api_data = r.json()["data"]
 
-vals = {}
-for item in api_data:
-    rid = item["id"]
-    res = item["result"]
-    if rid.startswith("ema50"):
-        vals["ema50"] = res["value"]
-    elif rid.startswith("ema200"):
-        vals["ema200"] = res["value"]
-    elif rid.startswith("rsi"):
-        vals["rsi"] = res["value"]
-    elif rid.startswith("macd"):
-        vals["macd_hist"] = res["valueMACDHist"]
+def decide(data):
+    ema50, ema200 = data['ema50'], data['ema200']
+    macd_hist     = data['macd']['histogram']
+    rsi           = data['rsi14']
 
-# 2️⃣  Determine trading bias
-bias = "flat"
-if all(k in vals for k in ("ema50", "ema200", "macd_hist", "rsi")):
-    if vals["ema50"] > vals["ema200"] and vals["macd_hist"] > 0 and vals["rsi"] > 55:
-        bias = "long"
-    elif vals["ema50"] < vals["ema200"] and vals["macd_hist"] < 0 and vals["rsi"] < 45:
-        bias = "short"
+    uptrend   = ema50 > ema200
+    downtrend = ema50 < ema200
 
-payload = {
-    "symbol": SYMBOL.replace("/", ""),
-    "interval": INTERVAL,
-    "timestamp": datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
-    "indicators": vals,
-    "bias": bias,
-}
+    bull_mom  = macd_hist >  MACD_EPS
+    bear_mom  = macd_hist < -MACD_EPS
 
-# 3️⃣  Update (or create) file in the target Gist
-update_url = f"https://api.github.com/gists/{GIST_ID}"
-headers = {
-    "Authorization": f"token {GIST_TOKEN}",
-    "Accept": "application/vnd.github+json",
-}
-gist_body = {"files": {FILE_NAME: {"content": json.dumps(payload, indent=2)}}}
+    long  = uptrend   and bull_mom and rsi > 55
+    short = downtrend and bear_mom and rsi < 45
+    if long:
+        return 'long'
+    if short:
+        return 'short'
+    return 'flat'
 
-g = requests.patch(update_url, headers=headers, json=gist_body, timeout=10)
-g.raise_for_status()
 
-print(f"✔ Updated {FILE_NAME} in gist {GIST_ID} – bias: {bias}")
+def main():
+    try:
+        data = fetch_all()
+    except Exception as e:
+        print('Error fetching indicators:', e, file=sys.stderr)
+        sys.exit(1)
+
+    bias = decide(data)
+
+    payload = {
+        'symbol': SYMBOL.replace('/', ''),
+        'interval': INTERVAL,
+        'timestamp': dt.datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+        'indicators': data,
+        'bias': bias,
+        'ttl_sec': 900,  # 15 min validity
+    }
+
+    with open(FILE_NAME, 'w') as fp:
+        json.dump(payload, fp, indent=2)
+
+    patch_body = {
+        'files': {FILE_NAME: {'content': json.dumps(payload, indent=2)}}
+    }
+
+    resp = SESSION.patch(
+        f'https://api.github.com/gists/{GIST_ID}',
+        headers={
+            'Authorization': f'token {GIST_TOKEN}',
+            'Accept': 'application/vnd.github+json',
+        },
+        data=json.dumps(patch_body),
+        timeout=15,
+    )
+    resp.raise_for_status()
+    print('Gist updated →', resp.json().get('html_url', 'ok'))
+
+if __name__ == '__main__':
+    main()
