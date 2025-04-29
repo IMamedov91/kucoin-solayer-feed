@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-solayer_feed.py
+kucoin_solayer_feed.py
 
 Fetches EMA 50, EMA 200, RSI 14 and MACD histogram for LAYER/USDT on Binance via
 TAAPI.io’s bulk endpoint, derives a bias (long / short / flat) and updates a
