@@ -1,7 +1,7 @@
 name: Binance SOLayer TAAPI feed
 
 on:
-  # Run elke 15 min (op :01/:16/:31/:46)
+  # Run every 15 min (at :01/:16/:31/:46)
   schedule:
     - cron: '1/15 * * * *'
   workflow_dispatch:
@@ -10,48 +10,34 @@ concurrency:
   group: solayer-taapi-feed
   cancel-in-progress: true
 
+permissions:
+  contents: write     # needed to PATCH the Gist
+
 jobs:
   push-feed:
     runs-on: ubuntu-latest
 
     steps:
-      # 1 – repo klonen
       - uses: actions/checkout@v4
 
-      # 2 – Python 3.11 klaarzetten
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'           # built‑in pip cache
 
-      # 3 – pip‑cache (sneller)
-      - name: Cache pip installs
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      # 4 – Dependencies installeren (fallback als er geen requirements.txt is)
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -s requirements.txt ]; then
-            pip install --no-cache-dir -r requirements.txt
-          else
-            pip install --no-cache-dir pandas ta requests
-          fi
+          pip install requests
 
-      # 5 – Feed genereren & Gist bijwerken
       - name: Update SOLayer TAAPI feed
         env:
           TAAPI_SECRET: ${{ secrets.TAAPI_SECRET }}
           GIST_TOKEN:   ${{ secrets.GIST_TOKEN }}
           GIST_ID:      ${{ secrets.GIST_ID }}
 
-          # Optionele overrides
+          # Optional overrides
           SYMBOL:       LAYER/USDT
           GRANULARITY:  15m
-          SNAP_LEN:     300
           FILE_NAME:    solayer_feed.json
-        run: python kucoin_solayer_feed.py
+        run: python solayer_feed.py
