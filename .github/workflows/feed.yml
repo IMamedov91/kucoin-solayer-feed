@@ -2,7 +2,7 @@ name: Binance SOLayer TAAPI feed
 
 on:
   schedule:
-    - cron: '1/15 * * * *'         # :01 / :16 / :31 / :46
+    - cron: '1/15 * * * *'
   workflow_dispatch:
 
 concurrency:
@@ -10,7 +10,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: write                  # alleen nodig om de Gist te patchen
+  contents: write          # alleen nodig om de Gist bij te werken
 
 jobs:
   push-feed:
@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5   # incl. pip-cache
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
@@ -30,19 +30,18 @@ jobs:
 
       - name: Update SOLayer TAAPI feed
         env:
-          # ── Secrets ─────────────────────────────
+          # ── Secrets ──
           TAAPI_SECRET: ${{ secrets.TAAPI_SECRET }}
           GIST_TOKEN:   ${{ secrets.GIST_TOKEN }}
           GIST_ID:      ${{ secrets.GIST_ID }}
 
-          # ── Parameters ─────────────────────────
-          SYMBOL:           LAYER/USDT     # Binance-notatie met slash
-          TF_FAST:          15m            # entry-chart
-          TF_SLOW:          1h             # trend-filter
-          ATR_PCT_MIN:      0.005          # 0.5 % volatiliteits-gate
-          FUNDING_MAX_LONG: 0              # long alleen ≤ 0 %
-          FUNDING_MIN_SHORT: 0.0002        # short alleen ≥ 0.02 %
-          MACD_EPS:         0.0005         # ruisdrempel
+          # ── Strategie-instellingen ──
+          SYMBOL:           LAYER/USDT    # ↔ Binance-spot-paar
+          TF_FAST:          15m
+          TF_SLOW:          1h
+          ATR_PCT_MIN_FAST: 0.005         # 0.5 %
+          ATR_PCT_MIN_SLOW: 0.007         # 0.7 %
+          MACD_EPS:         0.0005
           RSI_HIGH:         55
           RSI_LOW:          45
           FILE_NAME:        solayer_feed.json
