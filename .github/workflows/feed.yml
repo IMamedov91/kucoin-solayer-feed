@@ -1,17 +1,19 @@
-name: Binance SOLayer TAAPI feed
+name: Binance SOLayer TAAPI feed
 
 on:
-  # Run every 15 min (at :01/:16/:31/:46)
   schedule:
+    # run at :01/:16/:31/:46 each hour (4× per hour)
     - cron: '1/15 * * * *'
   workflow_dispatch:
 
+# avoid parallel runs that touch the same Gist
 concurrency:
   group: solayer-taapi-feed
   cancel-in-progress: true
 
+# least‑privilege: we only need to write to the Gist
 permissions:
-  contents: write     # needed to PATCH the Gist
+  contents: write
 
 jobs:
   push-feed:
@@ -20,24 +22,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Python 3.11 with built‑in pip cache (no extra cache step needed)
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'           # built‑in pip cache
+          cache: 'pip'
 
+      # Install deps (lightweight fallback if no requirements.txt yet)
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests
+          if [ -s requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install requests pandas
+          fi
 
+      # Run the feed generator & update the Gist
       - name: Update SOLayer TAAPI feed
         env:
           TAAPI_SECRET: ${{ secrets.TAAPI_SECRET }}
           GIST_TOKEN:   ${{ secrets.GIST_TOKEN }}
           GIST_ID:      ${{ secrets.GIST_ID }}
-
-          # Optional overrides
+          # overrideables
           SYMBOL:       LAYER/USDT
-          GRANULARITY:  15m
+          INTERVAL:     15m
           FILE_NAME:    solayer_feed.json
+          MACD_EPS:     0.0005      # threshold for ~flat histogram
         run: python kucoin_solayer_feed.py
