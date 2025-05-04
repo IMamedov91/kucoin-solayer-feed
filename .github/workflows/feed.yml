@@ -2,7 +2,7 @@ name: Binance SOLayer TAAPI feed
 
 on:
   schedule:
-    - cron: '1/15 * * * *'
+    - cron: '1/15 * * * *'    # :01 :16 :31 :46
   workflow_dispatch:
 
 concurrency:
@@ -10,7 +10,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: write          # alleen nodig om de Gist bij te werken
+  contents: write             # voor het PATCH-en van de Gist
 
 jobs:
   push-feed:
@@ -26,23 +26,28 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests pandas
+          pip install requests
 
-      - name: Update SOLayer TAAPI feed
+      - name: Build & push SOLayer feed
+        id: feed
         env:
-          # ── Secrets ──
+          # secrets
           TAAPI_SECRET: ${{ secrets.TAAPI_SECRET }}
           GIST_TOKEN:   ${{ secrets.GIST_TOKEN }}
           GIST_ID:      ${{ secrets.GIST_ID }}
-
-          # ── Strategie-instellingen ──
-          SYMBOL:           LAYER/USDT    # ↔ Binance-spot-paar
+          # strategy-settings
+          SYMBOL:           LAYER/USDT
           TF_FAST:          15m
           TF_SLOW:          1h
-          ATR_PCT_MIN_FAST: 0.005         # 0.5 %
-          ATR_PCT_MIN_SLOW: 0.007         # 0.7 %
+          ATR_PCT_MIN_FAST: 0.005
+          ATR_PCT_MIN_SLOW: 0.007
           MACD_EPS:         0.0005
           RSI_HIGH:         55
           RSI_LOW:          45
           FILE_NAME:        solayer_feed.json
-        run: python kucoin_solayer_feed.py
+        run: |
+          python solayer_feed.py > rawurl.txt
+          echo "::set-output name=rawurl::$(cat rawurl.txt)"
+
+      - name: Print latest raw-URL
+        run: echo "Latest feed URL: ${{ steps.feed.outputs.rawurl }}"
