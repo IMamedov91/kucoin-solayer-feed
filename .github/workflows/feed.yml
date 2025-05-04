@@ -46,7 +46,7 @@ jobs:
           RSI_LOW:          45
           FILE_NAME:        solayer_feed.json
         run: |
-          python solayer_feed.py > rawurl.txt
+          python kucoin_solayer_feed.py > rawurl.txt
           echo "::set-output name=rawurl::$(cat rawurl.txt)"
 
       - name: Print latest raw-URL
